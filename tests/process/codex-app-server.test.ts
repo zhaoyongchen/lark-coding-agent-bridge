@@ -127,7 +127,7 @@ describe('Codex app-server transport', () => {
     expect(await nextTurn(events)).toEqual([
       { type: 'system', threadId: 'thr-new' },
       { type: 'final_text', content: 'reply 1' },
-      { type: 'usage', inputTokens: 100, cachedInputTokens: 60, outputTokens: 5, reasoningOutputTokens: 0 },
+      { type: 'usage', inputTokens: 100, cachedInputTokens: 60, outputTokens: 5, reasoningOutputTokens: 0, contextTokens: 100 },
       { type: 'done', threadId: 'thr-new', terminationReason: 'normal' },
     ]);
     expect(run.send?.('second')).toBe(true);

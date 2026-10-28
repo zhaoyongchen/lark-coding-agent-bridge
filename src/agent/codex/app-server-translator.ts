@@ -17,6 +17,9 @@ export class CodexAppServerTranslator {
   private terminal = false;
   private readonly usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
   private sawUsage = false;
+  /** Prompt size of the latest call and the model's window, for the context warning. */
+  private contextTokens: number | undefined;
+  private contextWindow: number | undefined;
 
   constructor(threadId: string) {
     this.threadId = threadId;
@@ -42,9 +45,13 @@ export class CodexAppServerTranslator {
         const delta = str(params.delta);
         return delta ? [{ type: 'thinking', delta }] : [];
       }
-      case 'thread/tokenUsage/updated':
-        this.addUsage(record(record(params.tokenUsage)?.last));
+      case 'thread/tokenUsage/updated': {
+        const tokenUsage = record(params.tokenUsage);
+        this.addUsage(record(tokenUsage?.last));
+        const window = num(tokenUsage?.modelContextWindow);
+        if (window > 0) this.contextWindow = window;
         return [];
+      }
       case 'error': {
         const message = str(record(params.error)?.message);
         if (message) {
@@ -124,7 +131,14 @@ export class CodexAppServerTranslator {
       events.push({ type: 'final_text', content: this.pendingAgentMessage });
     }
     this.pendingAgentMessage = undefined;
-    if (this.sawUsage) events.push({ type: 'usage', ...this.usage });
+    if (this.sawUsage) {
+      events.push({
+        type: 'usage',
+        ...this.usage,
+        ...(this.contextTokens !== undefined ? { contextTokens: this.contextTokens } : {}),
+        ...(this.contextWindow !== undefined ? { contextWindow: this.contextWindow } : {}),
+      });
+    }
     events.push({
       type: 'done',
       threadId: this.threadId,
@@ -136,6 +150,8 @@ export class CodexAppServerTranslator {
   private addUsage(last: Record<string, unknown> | undefined): void {
     if (!last) return;
     this.sawUsage = true;
+    // Codex's `inputTokens` already includes the cached part.
+    if (num(last.inputTokens) > 0) this.contextTokens = num(last.inputTokens);
     this.usage.inputTokens += num(last.inputTokens);
     this.usage.cachedInputTokens += num(last.cachedInputTokens);
     this.usage.outputTokens += num(last.outputTokens);

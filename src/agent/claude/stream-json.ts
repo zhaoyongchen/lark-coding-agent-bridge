@@ -27,16 +27,13 @@ interface ClaudeRawEvent {
   session_id?: string;
   cwd?: string;
   model?: string;
-  message?: { content?: ContentBlock[] };
+  message?: { content?: ContentBlock[]; usage?: PromptUsage };
   /** Set on messages from inside a subagent (Agent/Task tool) — the id of the
    * parent's tool_use that spawned it. Absent or null for the main agent. */
   parent_tool_use_id?: string | null;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-  };
+  usage?: PromptUsage & { output_tokens?: number };
+  /** On `result`: per-model totals, each with the model's `contextWindow`. */
+  modelUsage?: Record<string, { contextWindow?: unknown } | null | undefined>;
   total_cost_usd?: number;
   num_turns?: number;
   /** `system/background_tasks_changed`: the full list of running background tasks. */
@@ -47,6 +44,22 @@ interface ClaudeRawEvent {
   task_id?: string;
   status?: string;
   summary?: string;
+}
+
+interface PromptUsage {
+  input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/**
+ * How full the main agent's context is, carried across the events of one
+ * process: the model from `init`, the prompt size of the latest main-agent
+ * call. The turn's `usage` event reports it; each `result` starts it over.
+ */
+export interface ClaudeContextMeter {
+  model?: string;
+  tokens?: number;
 }
 
 /**
@@ -72,7 +85,7 @@ function textOf(content: ContentBlock[] | undefined): string {
     .trim();
 }
 
-export function* translateEvent(raw: unknown): Generator<AgentEvent> {
+export function* translateEvent(raw: unknown, meter?: ClaudeContextMeter): Generator<AgentEvent> {
   if (!raw || typeof raw !== 'object') return;
   const evt = raw as ClaudeRawEvent;
 
@@ -135,6 +148,7 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
   }
 
   if (evt.type === 'system' && evt.subtype === 'init') {
+    if (meter && evt.model) meter.model = evt.model;
     yield {
       type: 'system',
       sessionId: evt.session_id,
@@ -166,6 +180,11 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
     const message = textOf(evt.message?.content);
     yield { type: 'rate_limit', blocked: true, ...(message ? { message } : {}), at: Date.now() };
     return;
+  }
+
+  if (evt.type === 'assistant' && meter) {
+    const tokens = promptTokens(evt.message?.usage);
+    if (tokens > 0) meter.tokens = tokens;
   }
 
   if (evt.type === 'assistant' && evt.message?.content) {
@@ -206,18 +225,46 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
       const { input_tokens, cache_read_input_tokens, cache_creation_input_tokens } = evt.usage;
       const anyInput =
         input_tokens !== undefined || cache_read_input_tokens !== undefined || cache_creation_input_tokens !== undefined;
+      const contextWindow = contextWindowOf(evt.modelUsage, meter?.model);
       yield {
         type: 'usage',
-        inputTokens: anyInput
-          ? (input_tokens ?? 0) + (cache_read_input_tokens ?? 0) + (cache_creation_input_tokens ?? 0)
-          : undefined,
+        inputTokens: anyInput ? promptTokens(evt.usage) : undefined,
         outputTokens: evt.usage.output_tokens,
         cachedInputTokens: cache_read_input_tokens,
         costUsd: evt.total_cost_usd,
+        ...(meter?.tokens !== undefined ? { contextTokens: meter.tokens } : {}),
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
       };
     }
+    if (meter) meter.tokens = undefined;
     yield { type: 'done', sessionId: evt.session_id, terminationReason: 'normal' };
   }
+}
+
+/** The whole prompt of a call, cached part included. */
+function promptTokens(usage: PromptUsage | undefined): number {
+  if (!usage) return 0;
+  return (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+}
+
+/**
+ * The main model's context window from `result.modelUsage`, keyed by model id
+ * (`claude-opus-5-5`; `init` may add a `[1m]`-style suffix). A turn that used
+ * subagents lists their models too, so an unmatched lone entry is the only
+ * other answer taken.
+ */
+function contextWindowOf(modelUsage: ClaudeRawEvent['modelUsage'], model: string | undefined): number | undefined {
+  if (!modelUsage || typeof modelUsage !== 'object') return undefined;
+  const windows = new Map<string, number>();
+  for (const [id, entry] of Object.entries(modelUsage)) {
+    const window = entry?.contextWindow;
+    if (typeof window === 'number' && Number.isFinite(window) && window > 0) windows.set(id, window);
+  }
+  if (model) {
+    const hit = windows.get(model) ?? windows.get(model.replace(/\[[^\]]*\]$/, ''));
+    if (hit !== undefined) return hit;
+  }
+  return windows.size === 1 ? [...windows.values()][0] : undefined;
 }
 
 /** `unifiedWindows` as 0–100 percentages with epoch-ms resets; malformed entries are skipped. */

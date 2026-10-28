@@ -76,6 +76,13 @@ export type AgentEvent =
       cachedInputTokens?: number;
       reasoningOutputTokens?: number;
       costUsd?: number;
+      /**
+       * Prompt size of the turn's last main-agent model call, cached part
+       * included: how full the conversation's context is now.
+       */
+      contextTokens?: number;
+      /** The model's context window in tokens, when the CLI reports it. */
+      contextWindow?: number;
     }
   | {
       type: 'done';

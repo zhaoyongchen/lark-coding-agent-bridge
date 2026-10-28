@@ -24,7 +24,7 @@ import { runWithAccountFailover } from './account-failover';
 import { probeAccountQuota, refreshPickQuota } from './quota-probe';
 import type { ClaudeAccountPool, PickedAccount } from './accounts';
 import { restoredSessionCost } from './session-cost';
-import { translateEvent } from './stream-json';
+import { translateEvent, type ClaudeContextMeter } from './stream-json';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
@@ -438,6 +438,7 @@ async function* createEventStream(
   let finished = false;
   // Background tasks claude last reported: stdin stays open while any run.
   let background = 0;
+  const contextMeter: ClaudeContextMeter = {};
   const track = (evt: AgentEvent): AgentEvent => {
     if (evt.type === 'background') background = evt.count;
     return perTurnCost(evt);
@@ -476,7 +477,7 @@ async function* createEventStream(
             pid: child.pid ?? null,
             unread: input.unreadCount,
           });
-          for (const evt of translateEvent(parsed)) {
+          for (const evt of translateEvent(parsed, contextMeter)) {
             if (evt.type === 'done') heldDone = evt;
             else yield track(evt);
           }
@@ -496,7 +497,7 @@ async function* createEventStream(
         else log.info('agent', 'turn-result-background', { pid: child.pid ?? null, background });
         finished = true;
       }
-      for (const evt of translateEvent(parsed)) yield track(evt);
+      for (const evt of translateEvent(parsed, contextMeter)) yield track(evt);
     }
   } finally {
     clearNextTurnGuard();

@@ -716,6 +716,56 @@ describe('markdown stream startup failures', () => {
     expect(h.controls.autoResumer?.get('oc_dm')).toBeUndefined();
   });
 
+  it('warns on the final card when the turn ended with a large context', async () => {
+    const cards: unknown[] = [];
+    const h = await createHarness({
+      agentKind: 'claude',
+      messageReply: 'card',
+      events: [
+        { type: 'text', delta: '改好了' },
+        { type: 'usage', inputTokens: 400_000, outputTokens: 50, contextTokens: 250_000, contextWindow: 1_000_000 },
+        { type: 'done', sessionId: 'sess-big', terminationReason: 'normal' },
+      ],
+      stream: sdkLikeCardStream(async (card) => {
+        cards.push(card);
+      }),
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_big_context', '改一下'));
+    await waitFor(() => JSON.stringify(cards.at(-1) ?? {}).includes('改好了') && h.agent.runs.length === 1);
+    await waitFor(() => JSON.stringify(cards.at(-1)).includes('Agent:'));
+
+    const finalCard = JSON.stringify(cards.at(-1));
+    expect(finalCard).toContain('上下文已约 25 万 token（约占窗口 25%）');
+    expect(finalCard).toContain('"cmd":"new"');
+  });
+
+  it('keeps the final card quiet when the context warning is off', async () => {
+    const cards: unknown[] = [];
+    const h = await createHarness({
+      agentKind: 'claude',
+      messageReply: 'card',
+      events: [
+        { type: 'text', delta: '改好了' },
+        { type: 'usage', inputTokens: 400_000, outputTokens: 50, contextTokens: 250_000, contextWindow: 1_000_000 },
+        { type: 'done', sessionId: 'sess-big', terminationReason: 'normal' },
+      ],
+      stream: sdkLikeCardStream(async (card) => {
+        cards.push(card);
+      }),
+    });
+    h.profileConfig.preferences.contextWarnTokens = 0;
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_big_context_off', '改一下'));
+    await waitFor(() => JSON.stringify(cards.at(-1) ?? {}).includes('Agent:'));
+
+    const finalCard = JSON.stringify(cards.at(-1));
+    expect(finalCard).not.toContain('上下文已约');
+    expect(finalCard).not.toContain('"cmd":"new"');
+  });
+
   it('sends one dedicated final reply card after progress completes in card mode', async () => {
     const progressCards: unknown[] = [];
     const h = await createHarness({

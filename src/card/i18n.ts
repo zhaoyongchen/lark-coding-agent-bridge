@@ -32,6 +32,17 @@ export function hasChinese(text: string): boolean {
   return HAN.test(text);
 }
 
+/** `25 万`, `8k`. */
+function zhTokens(tokens: number): string {
+  return tokens >= 10_000 ? `${Math.round(tokens / 10_000)} 万` : `${Math.max(1, Math.round(tokens / 1000))}k`;
+}
+
+/** `250k`, `1.2M`. */
+function enTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${Math.round(tokens / 100_000) / 10}M`;
+  return `${Math.max(1, Math.round(tokens / 1000))}k`;
+}
+
 export interface RunStrings {
   thinking: string;
   toolRunning: string;
@@ -52,6 +63,11 @@ export interface RunStrings {
   copyCode(index?: number, lang?: string): string;
   stopConfirmTitle: string;
   stopConfirmText: string;
+  /** 上下文过长告警 line under the answer; `percent` is the share of the compaction window. */
+  contextWarning(level: 'large' | 'near-compact', tokens: number, percent?: number): string;
+  newSession: string;
+  newSessionConfirmTitle: string;
+  newSessionConfirmText: string;
   interrupted: string;
   /** Terminal note when the run was cancelled because its message was recalled. */
   recalled: string;
@@ -107,6 +123,15 @@ const zh: RunStrings = {
   copyCode: (i, lang) => `📋 复制${i ? ` #${i}` : '代码'}${lang ? ` ${lang.toUpperCase()}` : ''}`,
   stopConfirmTitle: '终止这个任务？',
   stopConfirmText: '任务和它启动的命令都会被结束，无法恢复。',
+  contextWarning: (level, tokens, percent) => {
+    const size = `上下文已约 ${zhTokens(tokens)} token${percent !== undefined ? `（约占窗口 ${percent}%）` : ''}`;
+    return level === 'near-compact'
+      ? `⚠️ ${size}，快到自动压缩线，压缩后早期细节会丢失。建议现在开新会话（/new），旧会话可用 /resume 找回。`
+      : `⚠️ ${size}，每轮都要整段重读，回复变慢、额度消耗变快。这件事告一段落的话，建议开新会话（/new），旧会话可用 /resume 找回。`;
+  },
+  newSession: '🆕 开新会话',
+  newSessionConfirmTitle: '开新会话？',
+  newSessionConfirmText: '当前会话会归档（/resume 可找回），下一条消息从新会话开始；正在跑的任务会被中断。',
   interrupted: '_⏹ 已被中断_',
   recalled: '_↩️ 消息已撤回，任务已取消_',
   idleTimeout: (m) => `_⏱ ${m} 分钟无响应,已自动终止_`,
@@ -174,6 +199,16 @@ const en: RunStrings = {
   copyCode: (i, lang) => `📋 Copy${i ? ` #${i}` : ' code'}${lang ? ` ${lang.toUpperCase()}` : ''}`,
   stopConfirmTitle: 'Stop this task?',
   stopConfirmText: 'The task and every command it started will be ended. This cannot be undone.',
+  contextWarning: (level, tokens, percent) => {
+    const size = `Context is about ${enTokens(tokens)} tokens${percent !== undefined ? ` (~${percent}% of the window)` : ''}`;
+    return level === 'near-compact'
+      ? `⚠️ ${size}, close to auto-compaction, which drops earlier details. Consider a new session now (/new); /resume brings this one back.`
+      : `⚠️ ${size}; every turn re-reads all of it, so replies get slower and use more quota. If this task is wrapped up, consider a new session (/new); /resume brings this one back.`;
+  },
+  newSession: '🆕 New session',
+  newSessionConfirmTitle: 'Start a new session?',
+  newSessionConfirmText:
+    'This session is archived (/resume brings it back) and the next message starts fresh; a running task is interrupted.',
   interrupted: '_⏹ Stopped_',
   recalled: '_↩️ Message recalled — task cancelled_',
   idleTimeout: (m) => `_⏱ No response for ${m} min, stopped automatically_`,

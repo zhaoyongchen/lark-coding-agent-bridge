@@ -680,6 +680,16 @@ Thresholds are tunable in the config file (the profile's `preferences`; restart 
 }
 ```
 
+### Large-context warning (on by default)
+
+The longer a conversation gets, the more every turn re-reads: replies slow down, quota drains faster, and at the auto-compaction line earlier details get summarized away. The bridge can't tell when a task is over, so it checks the context size at the end of each turn (the prompt of the turn's last model call, cached part included):
+
+- Above the threshold (200k tokens by default), the reply card gets an orange line under the answer with the context size and its share of the window, suggesting a new session.
+- Close to auto-compaction (85% of the compaction window; with smart session compaction on, `compactWindowTokens` counts), it warns whatever the threshold, noting that compaction drops earlier details.
+- The line comes with a 「🆕 New session」 button; after a confirmation it does what `/new` does — the conversation is archived (`/resume` brings it back) and the next message starts fresh.
+
+Works for Claude Code and Codex (app-server); not shown in plain-text reply mode. The threshold is the profile's `preferences.contextWarnTokens` (tokens, `0` turns it off), config-file only.
+
 ### Automatic worktree cleanup (off by default)
 
 Enable 「Worktree 自动清理」 under `/config` → 运行与权限 or Web console → Configuration → Replies & runs, then save. Once an hour, the bridge checks worktrees registered by `/worktree add` that have been idle for at least 7 days. Existing worktrees and those created directly by an agent in a terminal are not enrolled automatically.

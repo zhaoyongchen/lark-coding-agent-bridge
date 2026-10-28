@@ -24,10 +24,31 @@ describe('Codex app-server translator', () => {
     expect(events).toContainEqual(expect.objectContaining({ type: 'tool_result', output: 'hi-from-shell\n', isError: false }));
     expect(events.slice(-3)).toEqual([
       { type: 'final_text', content: 'one' },
-      // Per-call usage summed over the turn (17340 + 17396 input).
-      { type: 'usage', inputTokens: 34_736, cachedInputTokens: 33_280, outputTokens: 34, reasoningOutputTokens: 0 },
+      // Per-call usage summed over the turn (17340 + 17396 input); the context is the last call's prompt.
+      {
+        type: 'usage',
+        inputTokens: 34_736,
+        cachedInputTokens: 33_280,
+        outputTokens: 34,
+        reasoningOutputTokens: 0,
+        contextTokens: 17_396,
+      },
       { type: 'done', threadId: 'thread-1', terminationReason: 'normal' },
     ]);
+  });
+
+  it('reports the context window when the app-server sends it', () => {
+    const t = new CodexAppServerTranslator('thread-1');
+    t.notification('thread/tokenUsage/updated', {
+      tokenUsage: { last: { inputTokens: 120_000, cachedInputTokens: 100_000, outputTokens: 10 }, modelContextWindow: 272_000 },
+    });
+    t.notification('thread/tokenUsage/updated', {
+      tokenUsage: { last: { inputTokens: 130_000, cachedInputTokens: 120_000, outputTokens: 20 } },
+    });
+    const events = t.notification('turn/completed', { turn: { id: 'x', status: 'completed' } });
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'usage', inputTokens: 250_000, contextTokens: 130_000, contextWindow: 272_000 }),
+    );
   });
 
   it('reports an interrupted turn as interrupted, keeping what was said as progress', () => {

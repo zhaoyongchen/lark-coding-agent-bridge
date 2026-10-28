@@ -53,6 +53,7 @@ import {
   getAgentStopGraceMs,
   getCotMessages,
   getMaxConcurrentRuns,
+  getContextWarning,
   getMessageReplyMode,
   getLongRunNoticeMs,
   getRunIdleTimeoutMs,
@@ -60,6 +61,7 @@ import {
   getSmartSession,
   getWorktreeCleanupIdleDays,
   resolveBotOverload,
+  type ContextWarningSettings,
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
 import { tmpdir } from 'node:os';
@@ -94,6 +96,7 @@ import {
 } from '../runtime/run-executor';
 import { probeAgentSession } from '../agent/session-probe';
 import type { SessionCatalog } from '../session/catalog';
+import { contextWarningFor, type ContextWarning } from '../session/context-warning';
 import {
   newSessionRequest,
   rotationNotice,
@@ -1608,6 +1611,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const modelSwitched = prevModel !== undefined && prevModel !== modelSelection;
   lastRunModelByScope.set(scope, modelSelection);
   const smartSession = getSmartSession(controls.cfg);
+  const contextWarning = getContextWarning(controls.cfg);
   // A restricted chat fences every run there, the owner's included.
   const restrictedChat = controls.profileConfig.access.restrictedChats?.[chatId];
   const instructions = [
@@ -1880,6 +1884,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
     if (evt.type === 'usage' && cardRenderOptions.meta) {
       cardRenderOptions.meta.usage = usageLineOf([evt]);
+      cardRenderOptions.meta.contextWarning = contextWarningOf([evt], contextWarning, scope);
     }
     // Ground truth for "which model is actually running": claude reports the
     // model it loaded in its init event. Logging requested-vs-actual reveals
@@ -1996,6 +2001,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (!state) return;
     // The follow-up's byline reports the background turn's own consumption.
     const usage = turn.kind === 'turn' ? usageLineOf(turn.events) : undefined;
+    const turnContextWarning = turn.kind === 'turn' ? contextWarningOf(turn.events, contextWarning, scope) : undefined;
     await sendFinalReply({
       channel,
       chatId,
@@ -2004,7 +2010,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       replyMode,
       sendOpts,
       cardRenderOptions: cardRenderOptions.meta
-        ? { ...cardRenderOptions, meta: { ...cardRenderOptions.meta, usage } }
+        ? { ...cardRenderOptions, meta: { ...cardRenderOptions.meta, usage, contextWarning: turnContextWarning } }
         : cardRenderOptions,
     });
   };
@@ -3362,6 +3368,29 @@ async function sendExpiredPendingNotice(channel: LarkChannel, record: PendingRec
   } catch (err) {
     log.warn('pending', 'expired-notice-failed', { scope: record.scope, err: String(err) });
   }
+}
+
+/**
+ * 上下文过长告警 for a turn, judged on its last usage report; `undefined` when
+ * the feature is off or the context is still small.
+ */
+function contextWarningOf(
+  events: readonly AgentEvent[],
+  settings: ContextWarningSettings | undefined,
+  scope: string,
+): ContextWarning | undefined {
+  if (!settings) return undefined;
+  const usage = events.filter((e): e is Extract<AgentEvent, { type: 'usage' }> => e.type === 'usage').at(-1);
+  const warning = usage ? contextWarningFor(usage, settings) : undefined;
+  if (warning) {
+    log.info('session', 'context-warning', {
+      scope,
+      level: warning.level,
+      tokens: warning.tokens,
+      ...(warning.percent !== undefined ? { percent: warning.percent } : {}),
+    });
+  }
+  return warning;
 }
 
 /** Byline usage for a set of events (one turn), or undefined when none was reported. */

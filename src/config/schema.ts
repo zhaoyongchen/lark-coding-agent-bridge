@@ -186,6 +186,13 @@ export interface AppPreferences {
    */
   longRunNoticeMinutes?: number;
   /**
+   * 上下文过长告警. A reply whose turn ended with the conversation's context at
+   * or above this many tokens — or close to the agent CLI's auto-compaction
+   * line — carries a warning and a 「开新会话」 button on its card. Default
+   * 200000; 0 turns it off. Config-file only. See {@link getContextWarning}.
+   */
+  contextWarnTokens?: number;
+  /**
    * 过载保护: in these group chats, a batch made only of other bots' messages
    * is not answered while the agent account's quota is tight — the bot posts
    * an overload card instead and starts no run. Humans are always answered.
@@ -708,6 +715,30 @@ export function getLongRunNoticeMs(cfg: AppConfig): number | undefined {
   if (raw === undefined) return DEFAULT_LONG_RUN_NOTICE_MINUTES * 60_000;
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined;
   return Math.min(Math.max(Math.floor(raw), 1), 24 * 60) * 60_000;
+}
+
+export interface ContextWarningSettings {
+  /** Context size, in tokens, from which a reply warns. */
+  warnTokens: number;
+  /** Compaction window 会话智能压缩 hands the agent CLI, when it is on. */
+  compactWindowTokens?: number;
+}
+
+const DEFAULT_CONTEXT_WARN_TOKENS = 200_000;
+
+/**
+ * Resolved 上下文过长告警 settings, or `undefined` when off
+ * (`contextWarnTokens` ≤ 0). Out-of-range values fall back to the default.
+ */
+export function getContextWarning(cfg: AppConfig): ContextWarningSettings | undefined {
+  const raw = cfg.preferences?.contextWarnTokens;
+  if (typeof raw === 'number' && raw <= 0) return undefined;
+  const warnTokens =
+    typeof raw === 'number' && Number.isFinite(raw) && raw >= 10_000 && raw <= 2_000_000
+      ? Math.floor(raw)
+      : DEFAULT_CONTEXT_WARN_TOKENS;
+  const compactWindowTokens = getSmartSession(cfg)?.compactWindowTokens;
+  return { warnTokens, ...(compactWindowTokens !== undefined ? { compactWindowTokens } : {}) };
 }
 
 /**

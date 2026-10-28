@@ -1,3 +1,4 @@
+import type { ContextWarning } from '../session/context-warning';
 import { extractCodeBlocks } from './code-snippets';
 import { deepMaskEmails } from './mask-email';
 import { runStrings, type Locale, type RunStrings } from './i18n';
@@ -36,6 +37,8 @@ export interface RunCardMeta {
   usage?: string;
   /** One-off note about the conversation itself, e.g. that 会话智能压缩 started a fresh one. */
   notice?: string;
+  /** 上下文过长告警: the turn ended with a large context; the card suggests a new session. */
+  contextWarning?: ContextWarning;
 }
 
 export interface RunCardRenderOptions {
@@ -108,7 +111,9 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     elements.push(stopButton(options, t));
   } else {
     if (options.copyCode) elements.push(...copyButtons(state, options.copyCode, t));
-    elements.push(...byline(state.sponsor && options.meta ? { ...options.meta, sponsor: state.sponsor } : options.meta));
+    elements.push(
+      ...byline(state.sponsor && options.meta ? { ...options.meta, sponsor: state.sponsor } : options.meta, t),
+    );
   }
 
   // Mask raw emails across every text field so the Feishu tenant audit doesn't
@@ -145,7 +150,7 @@ function cardHeader(title: string, terminal: Terminal): object {
 }
 
 /** `hr` + grey agent/model line, mirroring what other bridge bots sign with. */
-function byline(meta: RunCardMeta | undefined): object[] {
+function byline(meta: RunCardMeta | undefined, t: RunStrings): object[] {
   if (!meta) return [];
   const parts = [
     meta.agent ? `Agent: ${meta.agent}` : undefined,
@@ -155,11 +160,37 @@ function byline(meta: RunCardMeta | undefined): object[] {
     meta.sponsor ? `Sponsor: ${meta.sponsor}` : undefined,
     meta.usage ? `Usage: ${meta.usage}` : undefined,
   ].filter((p): p is string => p !== undefined);
-  if (parts.length === 0 && !meta.notice) return [];
+  if (parts.length === 0 && !meta.notice && !meta.contextWarning) return [];
   return [
     { tag: 'hr' },
     ...(meta.notice ? [{ tag: 'markdown', content: `<font color='grey'>🔄 ${meta.notice}</font>` }] : []),
+    ...(meta.contextWarning ? contextWarningRow(meta.contextWarning, t) : []),
     ...(parts.length > 0 ? [{ tag: 'markdown', content: `<font color='grey'>${parts.join(' | ')}</font>` }] : []),
+  ];
+}
+
+/**
+ * 上下文过长告警: an orange line and a button that runs `/new` — the same
+ * command (and permission check) as typing it. Feishu asks for confirmation
+ * first: it archives the conversation and interrupts a run in progress.
+ */
+function contextWarningRow(warning: ContextWarning, t: RunStrings): object[] {
+  return [
+    {
+      tag: 'markdown',
+      content: `<font color='orange'>${t.contextWarning(warning.level, warning.tokens, warning.percent)}</font>`,
+    },
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: t.newSession },
+      type: 'default',
+      size: 'small',
+      confirm: {
+        title: { tag: 'plain_text', content: t.newSessionConfirmTitle },
+        text: { tag: 'plain_text', content: t.newSessionConfirmText },
+      },
+      behaviors: [{ type: 'callback', value: { cmd: 'new' } }],
+    },
   ];
 }
 

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter.js';
-import { translateEvent } from '../../../src/agent/claude/stream-json.js';
+import { translateEvent, type ClaudeContextMeter } from '../../../src/agent/claude/stream-json.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 
 describe('Claude stream-json translator', () => {
@@ -131,6 +131,73 @@ describe('Claude stream-json translator', () => {
     expect([...translateEvent({ type: 'result', session_id: 'sess-2' })][0]).not.toHaveProperty('threadId');
   });
 
+  it('reports how full the main agent context is with the turn usage', () => {
+    const meter: ClaudeContextMeter = {};
+    const events = [
+      ...translateEvent({ type: 'system', subtype: 'init', session_id: 's', model: 'claude-opus-5-5[1m]' }, meter),
+      ...translateEvent(
+        {
+          type: 'assistant',
+          message: {
+            content: [{ type: 'tool_use', id: 't1', name: 'Agent', input: {} }],
+            usage: { input_tokens: 2, cache_read_input_tokens: 180_000, cache_creation_input_tokens: 3_000 },
+          },
+        },
+        meter,
+      ),
+      // A subagent's calls fill its own context, not the conversation's.
+      ...translateEvent(
+        {
+          type: 'assistant',
+          parent_tool_use_id: 't1',
+          message: { content: [{ type: 'text', text: 'x' }], usage: { input_tokens: 5, cache_read_input_tokens: 900_000 } },
+        },
+        meter,
+      ),
+      ...translateEvent(
+        {
+          type: 'assistant',
+          message: {
+            content: [{ type: 'text', text: 'answer' }],
+            usage: { input_tokens: 1, cache_read_input_tokens: 185_000, cache_creation_input_tokens: 999 },
+          },
+        },
+        meter,
+      ),
+      ...translateEvent(
+        {
+          type: 'result',
+          session_id: 's',
+          usage: { input_tokens: 3, output_tokens: 9, cache_read_input_tokens: 365_000 },
+          modelUsage: { 'claude-opus-5-5': { contextWindow: 1_000_000 }, 'claude-haiku-5-5': { contextWindow: 200_000 } },
+        },
+        meter,
+      ),
+    ];
+    expect(events.find((e) => e.type === 'usage')).toMatchObject({ contextTokens: 186_000, contextWindow: 1_000_000 });
+    expect(meter.tokens).toBeUndefined();
+  });
+
+  it('leaves the context out when the stream did not report it', () => {
+    const [usage] = [
+      ...translateEvent(
+        {
+          type: 'result',
+          session_id: 's',
+          usage: { input_tokens: 1 },
+          modelUsage: { a: { contextWindow: 100 }, b: { contextWindow: 200 } },
+        },
+        {},
+      ),
+    ];
+    expect(usage).not.toHaveProperty('contextTokens');
+    expect(usage).not.toHaveProperty('contextWindow');
+    const [lone] = [
+      ...translateEvent({ type: 'result', usage: { input_tokens: 1 }, modelUsage: { a: { contextWindow: 100 } } }, {}),
+    ];
+    expect(lone).toMatchObject({ contextWindow: 100 });
+  });
+
   it('ignores unknown, empty, and incomplete raw events', () => {
     expect([...translateEvent(null)]).toEqual([]);
     expect([...translateEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '' }] } })]).toEqual([]);
@@ -213,6 +280,29 @@ describe('Claude stream-json reader behavior', () => {
     expect(usages).toHaveLength(2);
     expect(usages[0]).toMatchObject({ inputTokens: 1060, cachedInputTokens: 1000, outputTokens: 20, costUsd: 0.02 });
     expect((usages[1] as { costUsd: number }).costUsd).toBeCloseTo(0.015, 10);
+  });
+
+  it('carries the context size of each turn through the adapter', async () => {
+    const binary = await createFakeBinary([
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's', model: 'claude-opus-5-5' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 4, cache_read_input_tokens: 250_000 } },
+      }),
+      JSON.stringify({
+        type: 'result',
+        num_turns: 1,
+        session_id: 's',
+        usage: { input_tokens: 4, output_tokens: 2, cache_read_input_tokens: 250_000 },
+        modelUsage: { 'claude-opus-5-5': { contextWindow: 1_000_000 } },
+      }),
+    ], 0, '');
+    cleanup = binary.cleanup;
+
+    const run = new ClaudeAdapter({ binary: binary.path }).run({ runId: 'run-context', prompt: 'hi', cwd: tmpdir() });
+    const usages = (await collect(run.events)).filter((e) => e.type === 'usage');
+
+    expect(usages).toEqual([expect.objectContaining({ contextTokens: 250_004, contextWindow: 1_000_000 })]);
   });
 
   it('subtracts the session total Claude restores on resume from the first turn', async () => {
