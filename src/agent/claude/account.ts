@@ -20,19 +20,29 @@ export interface ClaudeAccountResolverOptions {
   now?: () => number;
 }
 
-export function createClaudeAccountResolver(
-  opts: ClaudeAccountResolverOptions = {},
-): () => Promise<string | undefined> {
+export interface ClaudeAccountResolver {
+  (): Promise<string | undefined>;
+  /** What the last answered lookup found, however old — for callers that can't wait for a fresh one. */
+  latest(): string | undefined;
+}
+
+export function createClaudeAccountResolver(opts: ClaudeAccountResolverOptions = {}): ClaudeAccountResolver {
   const readStatus = opts.readStatus ?? readAuthStatus;
   const ttlMs = opts.ttlMs ?? 60_000;
   const now = opts.now ?? Date.now;
   let cached: { at: number; value: Promise<string | undefined> } | undefined;
-  return () => {
+  let settled: string | undefined;
+  const resolve = (): Promise<string | undefined> => {
     if (cached && now() - cached.at < ttlMs) return cached.value;
-    const value = readStatus().then(parseAuthStatus, () => undefined);
+    // A failed lookup (timeout, spawn error) leaves the last answer standing.
+    const value = readStatus().then(
+      (stdout) => (settled = parseAuthStatus(stdout)),
+      () => undefined,
+    );
     cached = { at: now(), value };
     return value;
   };
+  return Object.assign(resolve, { latest: () => settled });
 }
 
 /** Login username from `claude auth status` JSON — only for claude.ai logins. */

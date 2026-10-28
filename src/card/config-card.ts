@@ -1,4 +1,4 @@
-import type { AccountsPanel } from '../agent/account';
+import type { AccountsPanelRow } from '../agent/account';
 import { agentDescriptor } from '../agent/registry';
 import { modelLabel, supportedEfforts, supportedModels } from '../agent/models';
 import type { KnownChat } from '../bot/lark-info';
@@ -44,7 +44,7 @@ export interface ConfigFormOpts {
    * at the top of the card when present; omitted when no console is running. */
   consoleUrl?: string;
   /** The 订阅账号 panel (Claude profiles); omitted when the agent has none. */
-  accounts?: AccountsPanel;
+  accounts?: AccountsPanelRow[];
   /** What the last click on the 订阅账号 panel did, shown on top of it. */
   accountsNotice?: string;
 }
@@ -93,47 +93,77 @@ function sectionBlock(background: string, elements: object[]): object {
   };
 }
 
-/**
- * 订阅账号: every account's usage, a button to read the current one's quota
- * now, and one per other account to switch to it. Outside the form: the
- * buttons act at once and the card is redrawn with the outcome.
- */
-function accountsSection(panel: AccountsPanel, notice: string | undefined): object {
-  const buttons: object[] = [
-    {
+/** Column weights of the 订阅账号 list: account, 5 小时, 本周, state, button. */
+const ACCOUNT_COLUMN_WEIGHTS = [3, 3, 3, 4, 3];
+
+function accountListRow(cells: object[]): object {
+  return {
+    tag: 'column_set',
+    horizontal_spacing: '8px',
+    columns: cells.map((cell, i) => ({
+      tag: 'column',
+      width: 'weighted',
+      weight: ACCOUNT_COLUMN_WEIGHTS[i],
+      vertical_align: 'center',
+      elements: [cell],
+    })),
+  };
+}
+
+/** The row's button: read the quota of the account new runs use, or switch to another one. */
+function accountButton(row: AccountsPanelRow): object {
+  if (row.current) {
+    return {
       tag: 'button',
-      text: { tag: 'plain_text', content: '🔄 查询当前账号额度' },
+      text: { tag: 'plain_text', content: '🔄 查询额度' },
       type: 'primary_filled',
       size: 'small',
       behaviors: [{ type: 'callback', value: { cmd: 'config.quota' } }],
-    },
-    ...panel.targets.map((target) => ({
-      tag: 'button',
-      text: { tag: 'plain_text', content: `切到 ${target.name}` },
-      type: 'default',
-      size: 'small',
-      ...(target.refusal ? { disabled: true, disabled_tips: { tag: 'plain_text', content: target.refusal } } : {}),
-      behaviors: [{ type: 'callback', value: { cmd: 'config.account', arg: target.id } }],
-    })),
-  ];
+    };
+  }
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: '切换' },
+    type: 'default',
+    size: 'small',
+    ...(row.refusal ? { disabled: true, disabled_tips: { tag: 'plain_text', content: row.refusal } } : {}),
+    behaviors: [{ type: 'callback', value: { cmd: 'config.account', arg: row.id } }],
+  };
+}
+
+/**
+ * 订阅账号: one row per account — usage, resets, state — ending in its
+ * button. Outside the form: the buttons act at once and the card is redrawn
+ * with the outcome.
+ */
+function accountsSection(rows: AccountsPanelRow[], notice: string | undefined): object {
+  const header = ['账户', '5 小时用量 / 重置', '本周用量 / 重置', '状态', '操作'].map((title) => ({
+    tag: 'markdown',
+    content: `<font color="grey">${title}</font>`,
+  }));
   return sectionBlock('wathet-50', [
     { tag: 'markdown', content: '🔑 **订阅账号**' },
     ...(notice ? [{ tag: 'markdown', content: notice }] : []),
-    { tag: 'markdown', content: panel.table },
+    accountListRow(header),
+    ...rows.flatMap((row) => [
+      { tag: 'hr' },
+      accountListRow([
+        { tag: 'markdown', content: `${row.current ? '✅ ' : ''}**${row.name}**` },
+        { tag: 'markdown', content: row.fiveHour },
+        { tag: 'markdown', content: row.week },
+        { tag: 'markdown', content: row.state },
+        accountButton(row),
+      ]),
+    ]),
+    { tag: 'hr' },
     {
       tag: 'markdown',
       content:
         '<font color="grey">✅ 为新任务正在用的账号。' +
-        (panel.targets.length > 0
-          ? '点「切到」立即生效，下一条消息起用它，并一直用到它的切换线，之后照常自动切换；已到切换线或额度用尽的账号不能切。'
+        (rows.length > 1
+          ? '点「切换」立即生效，下一条消息起用它，并一直用到它的切换线，之后照常自动切换；已到切换线或额度用尽的账号不能切。'
           : '只有一个账号；添加备用账号：lark-channel-bridge claude-account add。') +
-        '查询额度：CLI 登录账号读 /usage，不耗额度；备用账号发一条 haiku 短请求，耗极少额度。</font>',
-    },
-    {
-      tag: 'column_set',
-      flex_mode: 'flow',
-      horizontal_spacing: 'small',
-      columns: buttons.map((button) => ({ tag: 'column', width: 'auto', elements: [button] })),
+        '「查询额度」实时读一次正在用的账号：CLI 登录账号读 /usage，不耗额度；备用账号发一条 haiku 短请求，耗极少额度。</font>',
     },
   ]);
 }

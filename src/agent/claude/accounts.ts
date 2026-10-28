@@ -901,19 +901,22 @@ export function accountsTable(rows: AccountRow[]): string {
   return out.join('\n');
 }
 
-/**
- * The accounts as a narrow Markdown table for cards (`/config`): usage and
- * resets per window, state, and how old the figures are.
- */
-export function accountsBriefTable(rows: AccountRow[], now = Date.now()): string {
-  const out = ['| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 状态 |', '|---|---|---|---|'];
-  for (const row of rows) {
-    const age = row.reportedAt !== undefined ? `（${formatAge(now - row.reportedAt)}）` : '';
-    out.push(
-      `| ${row.next ? '✅ ' : ''}**${row.name}** | ${windowCell(row.windows.five_hour, formatHoursMinutes)} | ${windowCell(row.windows.seven_day, formatDaysHours)} | ${stateCell(row)}${age} |`,
-    );
-  }
-  return out.join('\n');
+/** One account's cells in a card's account list (`/config`). */
+export interface AccountBrief {
+  /** `103% / 0h19m`: usage and time to reset. */
+  fiveHour: string;
+  week: string;
+  /** State and how old the figures are. */
+  state: string;
+}
+
+export function accountBrief(row: AccountRow, now = Date.now()): AccountBrief {
+  const age = row.reportedAt !== undefined ? `（${formatAge(now - row.reportedAt)}）` : '';
+  return {
+    fiveHour: windowCell(row.windows.five_hour, formatHoursMinutes),
+    week: windowCell(row.windows.seven_day, formatDaysHours),
+    state: `${stateCell(row)}${age}`,
+  };
 }
 
 /** `刚刚更新` / `12 分钟前更新` / `3 小时前更新` / `2 天前更新`. */

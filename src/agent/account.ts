@@ -2,8 +2,8 @@ import type { ProfileConfig } from '../config/profile-schema';
 import { log } from '../core/logger';
 import { claudeAccountName } from './claude/account';
 import {
+  accountBrief,
   accountRows,
-  accountsBriefTable,
   accountsReport,
   accountsTable,
   bestSwitchTarget,
@@ -18,6 +18,7 @@ import {
   switchRefusal,
   switchToAccount,
   WINDOW_KINDS,
+  type AccountBrief,
   type AccountWindowView,
   type ClaudeAccountEntry,
   type AccountRow,
@@ -179,45 +180,51 @@ async function switchClaudeAccount(profileDir: string, query: string | undefined
   return { head, rest: ['', accountsTable(after), '', `_${SCORE_NOTE}_`] };
 }
 
-/** The 订阅账号 panel of the `/config` card. */
-export interface AccountsPanel {
-  /** Markdown: every account's usage, resets and state. */
-  table: string;
-  /** The accounts a click may switch to (all but the one new runs use), with why a switch would be refused. */
-  targets: Array<{ id: string; name: string; refusal?: string }>;
+/** One account in the 订阅账号 panel of the `/config` card. */
+export interface AccountsPanelRow extends AccountBrief {
+  id: string;
+  name: string;
+  /** New runs use it: its button reads its quota; the others' switch to them. */
+  current: boolean;
+  /** Why a switch to it would be refused. */
+  refusal?: string;
 }
 
 /**
  * How long the `/config` card waits for the CLI login's name: `claude auth
- * status` takes from one to over ten seconds on Windows. Past it the login
- * shows as 「CLI 登录」; the lookup goes on and is cached for the next card.
+ * status` takes from one to over ten seconds on Windows. Past it the card
+ * uses the last name the CLI gave, or 「CLI 登录」 if it never answered yet.
  */
 const CARD_NAME_WAIT_MS = 1_500;
 
 function claudeLoginNameSoon(): Promise<string | undefined> {
   return Promise.race([
     claudeAccountName(),
-    new Promise<undefined>((resolve) => {
-      setTimeout(() => resolve(undefined), CARD_NAME_WAIT_MS).unref();
+    new Promise<string | undefined>((resolve) => {
+      setTimeout(() => resolve(claudeAccountName.latest()), CARD_NAME_WAIT_MS).unref();
     }),
   ]);
 }
 
 /** The profile's subscription accounts for the `/config` card. Undefined for agents without them. */
-export async function agentAccountsPanel(profileConfig: AccountProfile, profileDir: string): Promise<AccountsPanel | undefined> {
+export async function agentAccountsPanel(
+  profileConfig: AccountProfile,
+  profileDir: string,
+): Promise<AccountsPanelRow[] | undefined> {
   if (profileConfig.agentKind !== 'claude') return undefined;
   const pool = claudeAccountPool(profileDir);
   await pool.refresh();
-  const rows = accountRows(pool, await claudeLoginNameSoon());
-  return {
-    table: accountsBriefTable(rows),
-    targets: rows
-      .filter((row) => !row.next)
-      .map((row) => {
-        const refusal = switchRefusal(pool, row);
-        return { id: row.id, name: row.name, ...(refusal ? { refusal } : {}) };
-      }),
-  };
+  const now = Date.now();
+  return accountRows(pool, await claudeLoginNameSoon()).map((row) => {
+    const refusal = row.next ? undefined : switchRefusal(pool, row);
+    return {
+      id: row.id,
+      name: row.name,
+      current: row.next,
+      ...accountBrief(row, now),
+      ...(refusal ? { refusal } : {}),
+    };
+  });
 }
 
 /**

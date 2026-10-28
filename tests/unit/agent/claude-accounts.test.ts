@@ -11,7 +11,7 @@ import {
 } from '../../../src/agent/claude/account-failover.js';
 import {
   accountRows,
-  accountsBriefTable,
+  accountBrief,
   accountsReport,
   accountsTable,
   accountSecretId,
@@ -1260,19 +1260,16 @@ describe('a switch by name pins the account (在线切号)', () => {
     ]);
   });
 
-  it('lists the accounts in a narrow table for cards, with how old each reading is', async () => {
+  it('gives the cells of each account for the card list, with how old each reading is', async () => {
     const { pool } = await poolWith(['b']);
     pool.observe('default', limit({ windows: [
       { kind: 'five_hour', usedPercent: 46, resetsAt: NOW + 4 * HOUR + 32 * MIN },
       { kind: 'seven_day', usedPercent: 55, resetsAt: NOW + 2 * DAY + 22 * HOUR },
     ] }));
     const later = NOW + 12 * MIN;
-    const table = accountsBriefTable(accountRows(pool, 'shilong.wang', later), later);
-    expect(table.split('\n')).toEqual([
-      '| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 状态 |',
-      '|---|---|---|---|',
-      '| ✅ **shilong.wang** | 46% / 4h20m | 55% / 2d22h | 使用中（12 分钟前更新） |',
-      '| **b-name** | — | — | 还没运行过 |',
+    expect(accountRows(pool, 'shilong.wang', later).map((row) => accountBrief(row, later))).toEqual([
+      { fiveHour: '46% / 4h20m', week: '55% / 2d22h', state: '使用中（12 分钟前更新）' },
+      { fiveHour: '—', week: '—', state: '还没运行过' },
     ]);
   });
 

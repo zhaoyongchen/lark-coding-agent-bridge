@@ -51,4 +51,26 @@ describe('createClaudeAccountResolver', () => {
     });
     expect(await resolve()).toBeUndefined();
   });
+
+  it('keeps the last answer for callers that cannot wait, through a failed lookup', async () => {
+    let clock = 0;
+    let fail = false;
+    const resolve = createClaudeAccountResolver({
+      readStatus: async () => {
+        if (fail) throw new Error('claude auth status timed out');
+        return status({ loggedIn: true, authMethod: 'claude.ai', email: 'first@example.com' });
+      },
+      ttlMs: 1_000,
+      now: () => clock,
+    });
+
+    expect(resolve.latest()).toBeUndefined();
+    await resolve();
+    expect(resolve.latest()).toBe('first');
+
+    fail = true;
+    clock = 1_500;
+    expect(await resolve()).toBeUndefined();
+    expect(resolve.latest()).toBe('first');
+  });
 });

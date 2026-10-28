@@ -65,15 +65,17 @@ async function profile(): Promise<{ dir: string; pool: ClaudeAccountPool }> {
 }
 
 describe('the /config 订阅账号 panel', () => {
-  it('lists every account, and offers a switch to each one but the current, saying why one is refused', async () => {
+  it('lists every account, marking the current one and saying why a switch to another is refused', async () => {
     const { dir } = await profile();
-    const panel = await agentAccountsPanel(claude, dir);
-    expect(panel?.table).toContain('| ✅ **shilong.wang** | 10% / ');
-    expect(panel?.table).toContain('| **焦银玲** | 99% / ');
-    expect(panel?.targets).toEqual([
-      { id: 'b', name: '焦银玲', refusal: '5 小时窗口用量 99%，已到 98% 的切换线' },
-      { id: 'c', name: 'c' },
+    const rows = await agentAccountsPanel(claude, dir);
+    expect(rows?.map(({ id, name, current, refusal }) => ({ id, name, current, refusal }))).toEqual([
+      { id: 'default', name: 'shilong.wang', current: true, refusal: undefined },
+      { id: 'b', name: '焦银玲', current: false, refusal: '5 小时窗口用量 99%，已到 98% 的切换线' },
+      { id: 'c', name: 'c', current: false, refusal: undefined },
     ]);
+    expect(rows?.[0]?.fiveHour).toMatch(/^10% \/ /);
+    expect(rows?.[0]?.week).toMatch(/^30% \/ /);
+    expect(rows?.[1]?.fiveHour).toMatch(/^99% \/ /);
   });
 
   it('has nothing for an agent without subscription accounts', async () => {

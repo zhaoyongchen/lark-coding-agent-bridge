@@ -269,13 +269,19 @@ describe('config 课堂精练 switch', () => {
 });
 
 describe('configFormCard 订阅账号 panel', () => {
-  const accounts = {
-    table: '| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 状态 |\n|---|---|---|---|\n| ✅ **shilong.wang** | 10% / 1h0m | 30% / 3d0h | 使用中 |',
-    targets: [
-      { id: 'b', name: '焦银玲', refusal: '5 小时窗口用量 99%，已到 98% 的切换线' },
-      { id: 'c', name: 'c' },
-    ],
-  };
+  const accounts = [
+    { id: 'default', name: 'shilong.wang', current: true, fiveHour: '10% / 1h0m', week: '30% / 3d0h', state: '使用中' },
+    {
+      id: 'b',
+      name: '焦银玲',
+      current: false,
+      fiveHour: '99% / 1h0m',
+      week: '—',
+      state: '⚠️ 已过 5 小时切换线',
+      refusal: '5 小时窗口用量 99%，已到 98% 的切换线',
+    },
+    { id: 'c', name: 'c', current: false, fiveHour: '—', week: '—', state: '还没运行过' },
+  ];
 
   type Button = {
     tag: string;
@@ -299,18 +305,21 @@ describe('configFormCard 订阅账号 panel', () => {
     expect(JSON.stringify(configFormCard(base))).not.toContain('订阅账号');
   });
 
-  it('shows the accounts above the form, with a quota button and a switch button per other account', () => {
+  it('shows the accounts above the form, each row ending in its button', () => {
     const card = configFormCard({ ...base, accounts });
     const elements = (card as { body: { elements: { tag: string }[] } }).body.elements;
     expect(JSON.stringify(elements[0])).toContain('🔑 **订阅账号**');
-    expect(JSON.stringify(elements[0])).toContain('✅ **shilong.wang**');
     expect(elements[1]?.tag).toBe('form');
     const panel = buttons(elements[0]);
     expect(panel.map((b) => [b.text.content, b.behaviors[0]?.value])).toEqual([
-      ['🔄 查询当前账号额度', { cmd: 'config.quota' }],
-      ['切到 焦银玲', { cmd: 'config.account', arg: 'b' }],
-      ['切到 c', { cmd: 'config.account', arg: 'c' }],
+      ['🔄 查询额度', { cmd: 'config.quota' }],
+      ['切换', { cmd: 'config.account', arg: 'b' }],
+      ['切换', { cmd: 'config.account', arg: 'c' }],
     ]);
+    // Each account is one row: name, 5 小时, 本周, state, then its button.
+    const rows = JSON.stringify(elements[0]);
+    expect(rows).toMatch(/✅ \*\*shilong\.wang\*\*.*10% \/ 1h0m.*30% \/ 3d0h.*使用中.*🔄 查询额度/);
+    expect(rows).toMatch(/\*\*焦银玲\*\*.*99% \/ 1h0m.*已过 5 小时切换线.*切换/);
     // An account past its line cannot be switched to; the button says why.
     expect(panel[1]).toMatchObject({ disabled: true, disabled_tips: { content: '5 小时窗口用量 99%，已到 98% 的切换线' } });
     expect(panel[2]?.disabled).toBeUndefined();
