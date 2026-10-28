@@ -267,3 +267,57 @@ describe('config 课堂精练 switch', () => {
     expect(JSON.stringify(configSavedCard({ ...base, dream: false, dreamAuto: true }))).toContain('不生效');
   });
 });
+
+describe('configFormCard 订阅账号 panel', () => {
+  const accounts = {
+    table: '| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 状态 |\n|---|---|---|---|\n| ✅ **shilong.wang** | 10% / 1h0m | 30% / 3d0h | 使用中 |',
+    targets: [
+      { id: 'b', name: '焦银玲', refusal: '5 小时窗口用量 99%，已到 98% 的切换线' },
+      { id: 'c', name: 'c' },
+    ],
+  };
+
+  type Button = {
+    tag: string;
+    text: { content: string };
+    disabled?: boolean;
+    disabled_tips?: { content: string };
+    behaviors: { value: Record<string, unknown> }[];
+  };
+
+  function buttons(node: unknown, out: Button[] = []): Button[] {
+    if (Array.isArray(node)) node.forEach((item) => buttons(item, out));
+    else if (node && typeof node === 'object') {
+      const obj = node as Record<string, unknown>;
+      if (obj.tag === 'button') out.push(obj as unknown as Button);
+      Object.values(obj).forEach((value) => buttons(value, out));
+    }
+    return out;
+  }
+
+  it('is left out when the agent has no subscription accounts', () => {
+    expect(JSON.stringify(configFormCard(base))).not.toContain('订阅账号');
+  });
+
+  it('shows the accounts above the form, with a quota button and a switch button per other account', () => {
+    const card = configFormCard({ ...base, accounts });
+    const elements = (card as { body: { elements: { tag: string }[] } }).body.elements;
+    expect(JSON.stringify(elements[0])).toContain('🔑 **订阅账号**');
+    expect(JSON.stringify(elements[0])).toContain('✅ **shilong.wang**');
+    expect(elements[1]?.tag).toBe('form');
+    const panel = buttons(elements[0]);
+    expect(panel.map((b) => [b.text.content, b.behaviors[0]?.value])).toEqual([
+      ['🔄 查询当前账号额度', { cmd: 'config.quota' }],
+      ['切到 焦银玲', { cmd: 'config.account', arg: 'b' }],
+      ['切到 c', { cmd: 'config.account', arg: 'c' }],
+    ]);
+    // An account past its line cannot be switched to; the button says why.
+    expect(panel[1]).toMatchObject({ disabled: true, disabled_tips: { content: '5 小时窗口用量 99%，已到 98% 的切换线' } });
+    expect(panel[2]?.disabled).toBeUndefined();
+  });
+
+  it('puts what the last click did on top of the panel', () => {
+    const card = configFormCard({ ...base, accounts, accountsNotice: '✅ 已切换到 **c**' });
+    expect(JSON.stringify(card)).toContain('✅ 已切换到 **c**');
+  });
+});

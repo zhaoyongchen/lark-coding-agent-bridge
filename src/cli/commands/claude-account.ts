@@ -176,10 +176,10 @@ export async function runClaudeAccountSwitch(
     process.exit(1);
   }
   const boost = line !== undefined ? switchBoost(pool, target.id, line) : undefined;
-  await switchToAccount(paths, target.id, boost);
+  await switchToAccount(paths, target.id, boost, Boolean(query));
   await pool.refresh();
   console.log(
-    `✓ 已把 ${target.name}（${target.id}）设为主账户${boost ? `，切换线临时调到 ${line}%，该窗口重置后恢复` : ''}，运行中的 bridge 下一次运行前生效\n`,
+    `✓ 已把 ${target.name}（${target.id}）设为主账户${query ? '，到切换线之前不会自动换走' : ''}${boost ? `，切换线临时调到 ${line}%，该窗口重置后恢复` : ''}，运行中的 bridge 下一次运行前生效\n`,
   );
   console.log(accountsTable(accountRows(pool, label)).replace(/\*\*/g, ''));
 }

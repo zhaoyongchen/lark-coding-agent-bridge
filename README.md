@@ -292,7 +292,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws remove <name>` | Delete a named workspace |
 | `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
 | `/status` | Show profile, agent, working directory, session (current context size, time since the last exchange, and — with smart session compaction on — whether the next message starts a new conversation), lark-cli identity, and run state |
-| `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
+| `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy; on Claude profiles also switch subscription accounts and read the current account's quota |
 | `/invite user @name` | Allow a user to use the bot in DMs |
 | `/invite admin @name` | Add an access-control admin |
 | `/invite group` | Allow the current group to use the bot |

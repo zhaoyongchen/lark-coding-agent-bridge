@@ -335,7 +335,7 @@ export function helpCard(agentName = 'Agent'): object {
           '`/status` — 当前 profile、会话、工作目录、git、知识库状态，以及运行中任务的实况',
           '`/usage` — Claude 额度：5 小时窗口、本周用量和重置时间（不消耗额度）',
           '`/accounts` — Claude 订阅账户表：各账户用量、重置时间、切换线；`/accounts switch [名字] [百分比]` 切换账户（要在切换线以下；带百分比时临时调高该账户的切换线）',
-          '`/config` — 偏好、访问控制、lark-cli 身份策略',
+          '`/config` — 偏好、访问控制、lark-cli 身份策略；Claude 订阅账号在线切换、查询当前账号额度',
           '`/account` — 查看当前应用；`/account change` 换 appId/secret',
           '`/ps` · `/exit <id|#>` — 列出 / 关掉本机的 bot',
           '`/reconnect` — 强制重连（网络抖动后没反应时用）',

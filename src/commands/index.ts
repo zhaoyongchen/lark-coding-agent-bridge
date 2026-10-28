@@ -3,7 +3,14 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
-import { agentAccountsReport, agentAccountsTable, switchAgentAccount } from '../agent/account';
+import {
+  agentAccountsPanel,
+  agentAccountsReport,
+  agentAccountsTable,
+  refreshAgentAccountQuota,
+  switchAgentAccount,
+  switchAgentAccountBrief,
+} from '../agent/account';
 import { agentCapability } from '../agent/capability';
 import { agentDescriptor, type AgentKind } from '../agent/registry';
 import {
@@ -56,7 +63,7 @@ import {
 } from '../card/config-card';
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
-import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
+import { forgetManagedCard, isManaged, sendManagedCard, updateManagedCard } from '../card/managed';
 import {
   coffeeCard,
   cronCard,
@@ -3550,7 +3557,8 @@ async function removeGroupById(ctx: CommandContext, rawId: string): Promise<void
 // ────────────── /config — preferences form ──────────────
 
 async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
-  const sub = args.trim().split(/\s+/)[0] ?? '';
+  const [sub = '', ...rest] = args.trim().split(/\s+/);
+  const profileDir = commandProfilePaths(ctx).profileDir;
   switch (sub) {
     case '':
       return showConfigForm(ctx);
@@ -3558,12 +3566,20 @@ async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
       return submitConfig(ctx);
     case 'cancel':
       return cancelConfig(ctx);
-    default:
-      await reply(ctx, '用法:`/config`');
+    case 'account':
+      if (rest.length === 0) break;
+      return configAccountAction(ctx, () => switchAgentAccountBrief(ctx.controls.profileConfig, profileDir, rest.join(' ')));
+    case 'quota':
+      return configAccountAction(
+        ctx,
+        () => refreshAgentAccountQuota(ctx.controls.profileConfig, profileDir),
+        '⏳ 正在查询当前账号的额度…',
+      );
   }
+  await reply(ctx, '用法：`/config` 打开偏好设置；`/config account <账号名或 id>` 切换订阅账号；`/config quota` 查询当前账号额度。');
 }
 
-async function showConfigForm(ctx: CommandContext): Promise<void> {
+async function showConfigForm(ctx: CommandContext, accountsNotice?: string): Promise<void> {
   await Promise.all([
     ctx.controls.refreshOwner(ctx.channel).catch(() => {}),
     fetchKnownChats(ctx.channel)
@@ -3572,7 +3588,13 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
       })
       .catch(() => {}),
   ]);
+  const card = await buildConfigCard(ctx, accountsNotice);
+  if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
+  await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx));
+}
 
+/** The `/config` form as the profile stands now; `accountsNotice` tops its 订阅账号 panel. */
+async function buildConfigCard(ctx: CommandContext, accountsNotice?: string): Promise<object> {
   const ms = getRunIdleTimeoutMs(ctx.controls.cfg);
   const access = ctx.controls.profileConfig.access;
   // Surface the local web console URL when the supervisor (`--web-ui`) is
@@ -3580,7 +3602,13 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
   // alive so we don't advertise a stale address.
   const sidecar = await readUiSidecar(commandProfilePaths(ctx).hostUiFile).catch(() => undefined);
   const consoleUrl = sidecar && isAlive(sidecar.pid) ? sidecar.url : undefined;
-  const card = configFormCard({
+  const accounts = await agentAccountsPanel(ctx.controls.profileConfig, commandProfilePaths(ctx).profileDir).catch(
+    (err: unknown) => {
+      log.warn('command', 'config-accounts-panel-failed', { err: String(err) });
+      return undefined;
+    },
+  );
+  return configFormCard({
     agentKind: ctx.controls.profileConfig.agentKind,
     mode: ctx.controls.profileConfig.mode,
     model: normalizeModelSelection(
@@ -3607,9 +3635,54 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     chatRequireMention: access.chatRequireMention ?? {},
     chatAllowedUsers: access.chatAllowedUsers ?? {},
     ...(consoleUrl ? { consoleUrl } : {}),
+    ...(accounts ? { accounts } : {}),
+    ...(accountsNotice ? { accountsNotice } : {}),
   });
-  if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
-  await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx));
+}
+
+/**
+ * A click on the `/config` card's 订阅账号 panel (switch account, read the
+ * quota): run `action` and redraw the card with its outcome on top of the
+ * panel — in place once the click settled, showing `pending` meanwhile.
+ * Typed, it sends a new card instead.
+ */
+async function configAccountAction(ctx: CommandContext, action: () => Promise<string>, pending?: string): Promise<void> {
+  const outcome = async (): Promise<string> => {
+    try {
+      return await action();
+    } catch (err) {
+      log.fail('command', err, { step: 'config.accounts' });
+      return `❌ ${err instanceof Error ? err.message : String(err)}`;
+    }
+  };
+  if (!ctx.fromCardAction) {
+    await showConfigForm(ctx, await outcome());
+    return;
+  }
+  let cardMsgId = ctx.msg.messageId;
+  const redraw = async (notice: string): Promise<void> => {
+    const card = await buildConfigCard(ctx, notice);
+    if (isManaged(cardMsgId)) {
+      try {
+        await updateManagedCard(ctx.channel, cardMsgId, card);
+        return;
+      } catch (err) {
+        log.warn('command', 'config-card-redraw-fallback', { err: String(err) });
+      }
+    }
+    // Not updatable (the bridge restarted since it was sent): a new card.
+    cardMsgId = (await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx))).messageId;
+  };
+  // Detached, like a form submit: Lark's client locks the card while the click is handled.
+  void (async () => {
+    await new Promise<void>((r) => setTimeout(r, FORM_SETTLE_MS));
+    try {
+      if (pending) await redraw(pending);
+      await redraw(await outcome());
+    } catch (err) {
+      log.warn('command', 'config-card-redraw-failed', { err: String(err) });
+    }
+  })();
 }
 
 async function showResultCardInPlace(

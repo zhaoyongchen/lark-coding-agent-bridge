@@ -11,11 +11,13 @@ import {
 } from '../../../src/agent/claude/account-failover.js';
 import {
   accountRows,
+  accountsBriefTable,
   accountsReport,
   accountsTable,
   accountSecretId,
   bestSwitchTarget,
   findAccountRow,
+  formatAge,
   formatDaysHours,
   formatHoursMinutes,
   parseSwitchQuery,
@@ -1201,5 +1203,84 @@ describe('quota check before a run (refreshPickQuota)', () => {
       throw new Error('offline');
     };
     await expect(refreshPickQuota(pool, { probe, checkedAt: new Map(), now: () => NOW + HOUR })).resolves.toBeUndefined();
+  });
+});
+
+describe('a switch by name pins the account (在线切号)', () => {
+  const DAY = 24 * HOUR;
+  const MIN = 60_000;
+
+  async function scoredPool() {
+    const made = await poolWith(['b', 'c']);
+    made.pool.observe('default', limit({ windows: [
+      { kind: 'five_hour', usedPercent: 10, resetsAt: NOW + 2 * HOUR },
+      { kind: 'seven_day', usedPercent: 60, resetsAt: NOW + 6 * DAY },
+    ] }));
+    // b scores far better than c.
+    made.pool.observe('b', limit({ windows: [{ kind: 'seven_day', usedPercent: 10, resetsAt: NOW + DAY }] }));
+    made.pool.observe('c', limit({ windows: [{ kind: 'seven_day', usedPercent: 50, resetsAt: NOW + 5 * DAY }] }));
+    return made;
+  }
+
+  it('without a pin, the next run goes to the best score even right after a switch', async () => {
+    const { pool, paths } = await scoredPool();
+    await switchToAccount(paths, 'c');
+    await pool.refresh();
+    expect(pool.isPinned('c')).toBe(false);
+    expect(pool.pick()?.id).toBe('b');
+  });
+
+  it('a pinned main account keeps new runs below its lines, then the pin ends once runs move on', async () => {
+    const { pool, paths } = await scoredPool();
+    await switchToAccount(paths, 'c', undefined, true);
+    await pool.refresh();
+    expect(pool.isPinned('c')).toBe(true);
+    expect(pool.pick()?.id).toBe('c');
+    const row = accountRows(pool, undefined, NOW).find((r) => r.id === 'c')!;
+    expect(row).toMatchObject({ next: true, pinned: true });
+    expect(accountsTable([row])).toContain('使用中（手动指定）');
+    // At its line the pin no longer holds the run.
+    pool.observe('c', limit({ windows: [{ kind: 'five_hour', usedPercent: 99, resetsAt: NOW + HOUR }] }));
+    expect(pool.pick()?.id).toBe('b');
+    pool.promote('b');
+    expect(pool.isPinned('c')).toBe(false);
+    await pool.flush();
+    expect(readAccountsConfig(paths).accounts.find((a) => a.id === 'c')?.pinned).toBeUndefined();
+  });
+
+  it('reads the pin back, and only the main account keeps it when the order changes', async () => {
+    const { paths } = await poolWith([]);
+    await writeFile(paths.configFile, JSON.stringify({ accounts: [{ id: 'b', pinned: true }, { id: 'default' }, { id: 'c', pinned: 'yes' }] }));
+    expect(readAccountsConfig(paths).accounts.map((a) => a.pinned)).toEqual([true, undefined, undefined]);
+    await reorderAccounts(paths, ['default']);
+    expect(readAccountsConfig(paths).accounts.map((a) => [a.id, a.pinned])).toEqual([
+      ['default', undefined],
+      ['b', undefined],
+      ['c', undefined],
+    ]);
+  });
+
+  it('lists the accounts in a narrow table for cards, with how old each reading is', async () => {
+    const { pool } = await poolWith(['b']);
+    pool.observe('default', limit({ windows: [
+      { kind: 'five_hour', usedPercent: 46, resetsAt: NOW + 4 * HOUR + 32 * MIN },
+      { kind: 'seven_day', usedPercent: 55, resetsAt: NOW + 2 * DAY + 22 * HOUR },
+    ] }));
+    const later = NOW + 12 * MIN;
+    const table = accountsBriefTable(accountRows(pool, 'shilong.wang', later), later);
+    expect(table.split('\n')).toEqual([
+      '| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 状态 |',
+      '|---|---|---|---|',
+      '| ✅ **shilong.wang** | 46% / 4h20m | 55% / 2d22h | 使用中（12 分钟前更新） |',
+      '| **b-name** | — | — | 还没运行过 |',
+    ]);
+  });
+
+  it('words how old a reading is', () => {
+    expect(formatAge(0)).toBe('刚刚更新');
+    expect(formatAge(59_000)).toBe('刚刚更新');
+    expect(formatAge(12 * MIN)).toBe('12 分钟前更新');
+    expect(formatAge(3 * HOUR)).toBe('3 小时前更新');
+    expect(formatAge(50 * HOUR)).toBe('2 天前更新');
   });
 });

@@ -15,7 +15,7 @@ export const QUOTA_FRESH_MS = 15 * 60_000;
 const MAX_PROBES_PER_RUN = 3;
 const PROBE_TIMEOUT_MS = 30_000;
 
-export type QuotaProbe = (pool: ClaudeAccountPool, account: PickedAccount) => Promise<void>;
+export type QuotaProbe = (pool: ClaudeAccountPool, account: PickedAccount) => Promise<unknown>;
 
 /**
  * Before a run: make sure the account it would get has a recent quota reading,
@@ -46,15 +46,16 @@ export async function refreshPickQuota(
  * Read the account's quota as it is now: `/usage` for the CLI's own login (a
  * local command, no model turn), a one-line haiku request for a token account
  * (its token cannot read `/usage`; the reply carries the quota windows).
+ * True when the pool got a reading.
  */
-export async function probeAccountQuota(pool: ClaudeAccountPool, account: PickedAccount, binary = 'claude'): Promise<void> {
+export async function probeAccountQuota(pool: ClaudeAccountPool, account: PickedAccount, binary = 'claude'): Promise<boolean> {
   const opts = { timeoutMs: PROBE_TIMEOUT_MS, maxBytes: 256_000, env: account.env };
   if (!account.env.CLAUDE_CODE_OAUTH_TOKEN) {
     const result = await runCapture(binary, tmpdir(), ['-p', '/usage'], opts);
     const windows = result.ok ? parseClaudeUsage(result.stdout) : [];
     if (windows.length > 0) pool.observeUsage(account.id, usageByKind({ windows }));
     log.info('claude-accounts', 'quota-probed', { id: account.id, via: 'usage', ok: windows.length > 0 });
-    return;
+    return windows.length > 0;
   }
   const result = await runCapture(
     binary,
@@ -77,4 +78,5 @@ export async function probeAccountQuota(pool: ClaudeAccountPool, account: Picked
     }
   }
   log.info('claude-accounts', 'quota-probed', { id: account.id, via: 'haiku', ok: seen > 0 });
+  return seen > 0;
 }

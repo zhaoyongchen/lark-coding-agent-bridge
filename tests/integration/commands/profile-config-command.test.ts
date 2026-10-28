@@ -4,6 +4,14 @@ import { dirname, join } from 'node:path';
 import type { NormalizedMessage } from '@larksuite/channel';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActiveRuns } from '../../../src/bot/active-runs';
+import {
+  claudeAccountPool,
+  claudeAccountsPaths,
+  readAccountsConfig,
+  saveAccount,
+  type ClaudeAccountPool,
+  type PickedAccount,
+} from '../../../src/agent/claude/accounts';
 import { tryHandleCommand, type CommandContext, type Controls } from '../../../src/commands/index';
 import { resolveAppPaths } from '../../../src/config/app-paths';
 import { getSecret, listSecretIds } from '../../../src/config/keystore';
@@ -25,6 +33,16 @@ vi.mock('../../../src/utils/feishu-auth', () => ({
     botOpenId: 'ou-bot',
   })),
 }));
+
+vi.mock('../../../src/agent/claude/account', () => ({
+  claudeAccountName: vi.fn(async () => 'shilong.wang'),
+}));
+
+const quotaProbeMocks = vi.hoisted(() => ({
+  probeAccountQuota: vi.fn<(pool: ClaudeAccountPool, account: PickedAccount) => Promise<boolean>>(async () => false),
+}));
+
+vi.mock('../../../src/agent/claude/quota-probe', () => quotaProbeMocks);
 
 const identityPolicyMocks = vi.hoisted(() => ({
   applyLarkCliIdentityPolicy: vi.fn(async () => true),
@@ -245,6 +263,43 @@ describe('profile-aware account and config commands', () => {
     expect(card).toContain('已回滚');
     expect(card).not.toContain('未做任何修改');
     expect(card).not.toContain('偏好已保存');
+  });
+
+  it('switches the subscription account from the /config card and redraws it with the outcome', async () => {
+    const h = await createHarness();
+    const profileDir = join(h.rootDir, 'profiles', 'claude');
+    await saveAccount(claudeAccountsPaths(profileDir), { id: 'b', token: 'tok-b', label: '焦银玲' });
+
+    await h.command('/config account b');
+
+    await vi.waitFor(() => expect(h.channel.sent.length).toBe(1), { timeout: 5_000 });
+    const card = JSON.stringify(h.channel.sent[0]?.content);
+    expect(card).toContain('🔑 **订阅账号**');
+    expect(card).toContain('✅ 已切换到 **焦银玲**');
+    expect(card).toContain('✅ **焦银玲**');
+    expect(readAccountsConfig(claudeAccountsPaths(profileDir)).accounts[0]).toEqual({ id: 'b', label: '焦银玲', pinned: true });
+    await claudeAccountPool(profileDir).flush();
+  });
+
+  it('reads the current account quota from the /config card, showing progress, then the reading in place', async () => {
+    const h = await createHarness();
+    const profileDir = join(h.rootDir, 'profiles', 'claude');
+    quotaProbeMocks.probeAccountQuota.mockImplementationOnce(async (pool, account) => {
+      pool.observeUsage(account.id, { five_hour: { usedPercent: 42 }, seven_day: { usedPercent: 61 } });
+      return true;
+    });
+
+    await h.command('/config quota');
+
+    // The click's card is not one this process sent: the progress goes out as a new card…
+    await vi.waitFor(() => expect(h.channel.sent.length).toBe(1), { timeout: 5_000 });
+    expect(JSON.stringify(h.channel.sent[0]?.content)).toContain('⏳ 正在查询当前账号的额度…');
+    // …which the reading then replaces in place.
+    const updates = () => h.channel.rawClient.requests.filter((r) => r.method === 'cardkit.v1.card.update');
+    await vi.waitFor(() => expect(updates().length).toBe(1), { timeout: 5_000 });
+    expect(JSON.stringify(updates()[0]?.params)).toContain('🔄 **shilong.wang** 当前额度：5 小时 42% · 本周 61%');
+    expect(h.channel.sent.length).toBe(1);
+    await claudeAccountPool(profileDir).flush();
   });
 
   it('saves /account submit into the active v2 profile and profile-local keystore', async () => {

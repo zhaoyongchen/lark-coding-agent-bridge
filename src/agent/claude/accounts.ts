@@ -23,7 +23,8 @@ import type { QuotaReading, QuotaWindow } from '../quota';
  *      the best switch score ({@link switchScore}), checked again before every
  *      run; the main one (first on the list) keeps the run unless another
  *      beats it by more than {@link STICKY_MARGIN}, since every move re-reads
- *      the whole conversation uncached (the prompt cache is per account);
+ *      the whole conversation uncached (the prompt cache is per account) —
+ *      and whatever the scores say while it is pinned by a switch by name;
  *   2. once every account is past a line: of those not refused, the same
  *      way — accounts are used up one after another;
  *   3. once every account has been refused: the run waits for the soonest
@@ -77,6 +78,12 @@ export interface ClaudeAccountEntry {
    * Dropped as soon as runs move on to another account.
    */
   boost?: Partial<Record<WindowKind, LineBoost>>;
+  /**
+   * Picked by name (`/accounts switch <name>`, the `/config` card): the main
+   * account keeps new runs while below its lines, whatever the scores say.
+   * Dropped as soon as runs move on to another account.
+   */
+  pinned?: boolean;
 }
 
 export interface ClaudeAccountsConfig {
@@ -158,12 +165,13 @@ export function parseAccountsConfig(text: string): ClaudeAccountsConfig {
   const seen = new Set<string>();
   for (const item of Array.isArray(raw.accounts) ? raw.accounts : []) {
     if (!item || typeof item !== 'object') continue;
-    const { id, label, lines, reservePercent, boost } = item as {
+    const { id, label, lines, reservePercent, boost, pinned } = item as {
       id?: unknown;
       label?: unknown;
       lines?: unknown;
       reservePercent?: unknown;
       boost?: unknown;
+      pinned?: unknown;
     };
     if (typeof id !== 'string' || !isValidAccountId(id) || seen.has(id)) continue;
     seen.add(id);
@@ -178,6 +186,7 @@ export function parseAccountsConfig(text: string): ClaudeAccountsConfig {
       ...(typeof label === 'string' && label.trim() ? { label: label.trim() } : {}),
       ...(Object.keys(own).length > 0 ? { lines: own } : {}),
       ...(raised ? { boost: raised } : {}),
+      ...(pinned === true ? { pinned: true } : {}),
     });
   }
   if (!seen.has(DEFAULT_ACCOUNT_ID)) accounts.unshift({ id: DEFAULT_ACCOUNT_ID });
@@ -278,8 +287,11 @@ export async function reorderAccounts(paths: ClaudeAccountsPaths, ids: string[])
   if (new Set(ids).size !== ids.length) throw new Error('账户重复了');
   const first = ids.map((id) => config.accounts.find((a) => a.id === id)!);
   config.accounts = [...first, ...config.accounts.filter((a) => !ids.includes(a.id))];
-  // Raised lines belong to the main account alone.
-  for (const entry of config.accounts.slice(1)) delete entry.boost;
+  // Raised lines and a pin belong to the main account alone.
+  for (const entry of config.accounts.slice(1)) {
+    delete entry.boost;
+    delete entry.pinned;
+  }
   await writeAccountsConfig(paths, config);
   return config;
 }
@@ -380,6 +392,12 @@ export class ClaudeAccountPool {
     return this.config.accounts.find((a) => a.id === id)?.lines?.[kind] ?? this.config.lines[kind];
   }
 
+  /** The account was switched to by name and is still the main one (see {@link ClaudeAccountEntry.pinned}). */
+  isPinned(id: string): boolean {
+    const main = this.config.accounts[0];
+    return main?.id === id && main.pinned === true;
+  }
+
   /** Some window's line is raised right now (a switch by name). */
   isBoosted(id: string, now = this.now()): boolean {
     return WINDOW_KINDS.some((kind) => this.lineOf(id, kind, now) > this.baseLineOf(id, kind));
@@ -427,7 +445,7 @@ export class ClaudeAccountPool {
   /**
    * Of the accounts `ok` lets through: the best switch score, ties keeping the
    * list's order — except that the main one stays while no other beats it by
-   * more than {@link STICKY_MARGIN}.
+   * more than {@link STICKY_MARGIN}, or while it is pinned and below its lines.
    */
   private choose(
     exclude: ReadonlySet<string> | undefined,
@@ -437,6 +455,8 @@ export class ClaudeAccountPool {
   ): PickedAccount | undefined {
     const all = this.accounts();
     const candidates = all.filter((a) => !exclude?.has(a.id) && ok(a.id));
+    const main = candidates[0] && candidates[0].id === all[0]?.id ? candidates[0] : undefined;
+    if (main && this.isPinned(main.id) && this.underLinesAt(main.id, now, cap) <= now) return main;
     let best: PickedAccount | undefined;
     let bestScore = -1;
     for (const account of candidates) {
@@ -446,7 +466,6 @@ export class ClaudeAccountPool {
         bestScore = score;
       }
     }
-    const main = candidates[0] && candidates[0].id === all[0]?.id ? candidates[0] : undefined;
     if (main && best && best.id !== main.id && bestScore - this.score(main.id, now, cap) <= STICKY_MARGIN) return main;
     return best;
   }
@@ -760,6 +779,10 @@ export interface AccountRow {
   ready: boolean;
   /** Its lines are raised for now by a switch by name. */
   boosted: boolean;
+  /** Switched to by name: keeps new runs while below its lines. */
+  pinned: boolean;
+  /** When a run or quota check last reported its usage (epoch ms). */
+  reportedAt?: number;
   /** 0–1, see {@link switchScore}. */
   score: number;
 }
@@ -815,6 +838,7 @@ export function accountRows(pool: ClaudeAccountPool, defaultLabel: string | unde
     const known = windowsKnown(windows);
     const refusedUntil = pool.refusedUntil(account.id, now);
     const pastLine = pool.pastLine(account.id, now)?.kind;
+    const reportedAt = pool.reportedAt(account.id);
     return {
       id: account.id,
       name: account.id === DEFAULT_ACCOUNT_ID ? (defaultLabel ?? 'CLI 登录') : (account.label ?? account.id),
@@ -826,6 +850,8 @@ export function accountRows(pool: ClaudeAccountPool, defaultLabel: string | unde
       ...(pastLine ? { pastLine } : {}),
       ready: pool.underLinesAt(account.id, now) <= now,
       boosted: pool.isBoosted(account.id, now),
+      pinned: pool.isPinned(account.id),
+      ...(reportedAt !== undefined ? { reportedAt } : {}),
       score: switchScore(windows, known),
     };
   });
@@ -854,7 +880,8 @@ function stateCell(row: AccountRow): string {
   if (row.refusedUntil !== undefined) return `⛔ 额度用尽，${formatClock(row.refusedUntil)} 恢复`;
   if (row.pastLine) return `⚠️ 已过${WINDOW_LABELS[row.pastLine]}切换线`;
   if (!row.known) return '还没运行过';
-  return row.next ? '使用中' : '可用';
+  if (!row.next) return '可用';
+  return row.pinned ? '使用中（手动指定）' : '使用中';
 }
 
 /** The accounts as one Markdown table; ✅ marks the account new runs use. */
@@ -872,6 +899,30 @@ export function accountsTable(rows: AccountRow[]): string {
     );
   }
   return out.join('\n');
+}
+
+/**
+ * The accounts as a narrow Markdown table for cards (`/config`): usage and
+ * resets per window, state, and how old the figures are.
+ */
+export function accountsBriefTable(rows: AccountRow[], now = Date.now()): string {
+  const out = ['| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 状态 |', '|---|---|---|---|'];
+  for (const row of rows) {
+    const age = row.reportedAt !== undefined ? `（${formatAge(now - row.reportedAt)}）` : '';
+    out.push(
+      `| ${row.next ? '✅ ' : ''}**${row.name}** | ${windowCell(row.windows.five_hour, formatHoursMinutes)} | ${windowCell(row.windows.seven_day, formatDaysHours)} | ${stateCell(row)}${age} |`,
+    );
+  }
+  return out.join('\n');
+}
+
+/** `刚刚更新` / `12 分钟前更新` / `3 小时前更新` / `2 天前更新`. */
+export function formatAge(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return '刚刚更新';
+  if (minutes < 60) return `${minutes} 分钟前更新`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `${hours} 小时前更新` : `${Math.floor(hours / 24)} 天前更新`;
 }
 
 /**
@@ -894,24 +945,27 @@ export function findAccountRow(rows: AccountRow[], query: string): AccountRow | 
 
 /**
  * Make `id` the main account: new runs use it first; the rest keep their
- * order. Any raised lines end here; `boost` raises the new main account's.
+ * order. Any raised lines and pin end here; `boost` raises the new main
+ * account's lines, `pin` pins it ({@link ClaudeAccountEntry.pinned}).
  */
 export async function switchToAccount(
   paths: ClaudeAccountsPaths,
   id: string,
   boost?: ClaudeAccountEntry['boost'],
+  pin = false,
 ): Promise<ClaudeAccountsConfig> {
   const config = readAccountsConfig(paths);
   if (!config.accounts.some((a) => a.id === id)) throw new Error(`没有账户：${id}`);
   config.accounts = withMain(config.accounts, id);
   if (boost && Object.keys(boost).length > 0) config.accounts[0]!.boost = boost;
+  if (pin) config.accounts[0]!.pinned = true;
   await writeAccountsConfig(paths, config);
   return config;
 }
 
-/** `id` first, the rest in order, nobody's lines raised. */
+/** `id` first, the rest in order, nobody's lines raised or pinned. */
 function withMain(accounts: ClaudeAccountEntry[], id: string): ClaudeAccountEntry[] {
-  const plain = accounts.map(({ boost: _raised, ...entry }) => entry);
+  const plain = accounts.map(({ boost: _raised, pinned: _pinned, ...entry }) => entry);
   return [...plain.filter((a) => a.id === id), ...plain.filter((a) => a.id !== id)];
 }
 
