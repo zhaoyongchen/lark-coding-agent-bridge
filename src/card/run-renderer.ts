@@ -3,7 +3,7 @@ import { extractCodeBlocks } from './code-snippets';
 import { deepMaskEmails } from './mask-email';
 import { runStrings, type Locale, type RunStrings } from './i18n';
 import { pauseNotice } from './pause-notice';
-import type { Block, FooterStatus, RunState, Terminal, ToolEntry } from './run-state';
+import { backgroundLeft, type Block, type FooterStatus, type RunState, type Terminal, type ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
 
 const REASONING_MAX = 1500;
@@ -35,7 +35,10 @@ export interface RunCardMeta {
   sponsor?: string;
   /** This turn's consumption, e.g. `24.8k in / 51 out · ≈$0.03`. */
   usage?: string;
-  /** One-off note about the conversation itself, e.g. that 会话智能压缩 started a fresh one. */
+  /**
+   * One-off note about the conversation itself, e.g. that 会话智能压缩 started
+   * this run in a fresh one — shown at the top, since it happened before the run.
+   */
   notice?: string;
   /** 上下文过长告警: the turn ended with a large context; the card suggests a new session. */
   contextWarning?: ContextWarning;
@@ -80,6 +83,10 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   const elements: object[] = [];
   const t = runStrings(options.locale);
 
+  if (options.meta?.notice) {
+    elements.push({ tag: 'markdown', content: `<font color='grey'>🔄 ${options.meta.notice}</font>` });
+  }
+
   if (state.reasoning.content) {
     elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active, t));
   }
@@ -105,6 +112,8 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   } else if (state.terminal === 'done' && elements.length === 0) {
     elements.push(noteMd(t.noContent));
   }
+  const background = backgroundLeft(state);
+  if (background > 0) elements.push(noteMd(t.backgroundRunning(background)));
 
   if (state.terminal === 'running') {
     if (state.footer) elements.push(footerStatus(state.footer, t, options.activity));
@@ -130,6 +139,32 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     ...(options.meta ? { header: cardHeader(options.meta.title, state.terminal) } : {}),
     body: { elements },
   });
+}
+
+/**
+ * The card that opens a topic (自动开话题 / 前缀开话题): the progress card as
+ * it will first look, minus the stop button — there is no run to stop yet.
+ * The run that follows takes the card over and keeps updating it, so the
+ * topic's first post is the progress card rather than a line of its own.
+ */
+export function renderTopicOpenerCard(title: string, locale?: Locale): object {
+  const t = runStrings(locale);
+  return {
+    schema: '2.0',
+    config: { width_mode: 'fill', streaming_mode: true, summary: { content: t.summary.thinking } },
+    header: cardHeader(title, 'running'),
+    body: { elements: [footerStatus('thinking', t)] },
+  };
+}
+
+/** What a topic opener card becomes when no run takes it over: the plain notice it replaced. */
+export function renderTopicOpenedNotice(title: string, text: string): object {
+  return {
+    schema: '2.0',
+    config: { width_mode: 'fill', summary: { content: text } },
+    header: cardHeader(title, 'done'),
+    body: { elements: [{ tag: 'markdown', content: text }] },
+  };
 }
 
 /** Coloured title bar: wathet while healthy, red on failure, orange while
@@ -160,10 +195,9 @@ function byline(meta: RunCardMeta | undefined, t: RunStrings): object[] {
     meta.sponsor ? `Sponsor: ${meta.sponsor}` : undefined,
     meta.usage ? `Usage: ${meta.usage}` : undefined,
   ].filter((p): p is string => p !== undefined);
-  if (parts.length === 0 && !meta.notice && !meta.contextWarning) return [];
+  if (parts.length === 0 && !meta.contextWarning) return [];
   return [
     { tag: 'hr' },
-    ...(meta.notice ? [{ tag: 'markdown', content: `<font color='grey'>🔄 ${meta.notice}</font>` }] : []),
     ...(meta.contextWarning ? contextWarningRow(meta.contextWarning, t) : []),
     ...(parts.length > 0 ? [{ tag: 'markdown', content: `<font color='grey'>${parts.join(' | ')}</font>` }] : []),
   ];
@@ -402,7 +436,7 @@ function summaryText(state: RunState, t: RunStrings): string {
   if (state.terminal === 'idle_timeout') return t.summary.idleTimeout;
   if (state.terminal === 'paused') return t.summary.paused;
   if (state.terminal === 'error') return t.summary.error;
-  if (state.terminal === 'done') return t.summary.done;
+  if (state.terminal === 'done') return backgroundLeft(state) > 0 ? t.summary.backgroundRunning : t.summary.done;
   if (state.footer === 'tool_running') return t.summary.toolRunning;
   if (state.footer === 'streaming') return t.summary.streaming;
   return t.summary.thinking;

@@ -349,29 +349,14 @@ describe('DreamService', { timeout: TIMEOUT }, () => {
     expect(h.service.runs()[0]!.diary).toContain('记忆整合跳过（上一份记忆整合 PR 还没审完');
   });
 
-  it('with publish: push, folds a chat\'s scattered notes into one under the chat itself', async () => {
+  it('with publish: push, leaves raw notes as they are: the global digest folds them, only once its manifest exists', async () => {
     const h = await harness({
       tuning: { publish: 'push' },
-      answer: (prompt) =>
-        prompt.includes('<family>')
-          ? JSON.stringify({
-              merges: [
-                {
-                  into: { scope: 'oc_team', topic: 'build' },
-                  from: ['oc_team/build', 'oc_team_omt_x/build-tips'],
-                  entries: [
-                    { text: '全工程构建统一用 mvnd -T 10，并用全局锁包住', from: ['a00001', 'b00001'] },
-                    { text: '构建前先 install 上游模块', from: ['a00002'] },
-                  ],
-                  dropped: [],
-                  reason: '主会话和话题都在说本机构建',
-                },
-              ],
-            })
-          : JSON.stringify({
-              memory: [{ action: 'add', target: 'note', note: 'deploy', text: '发布按 docs/dev/ship.md 走', reason: '验证过', evidence: 'verified', sources: ['S1#1'] }],
-              skills: [],
-            }),
+      answer: () =>
+        JSON.stringify({
+          memory: [{ action: 'add', target: 'note', note: 'deploy', text: '发布按 docs/dev/ship.md 走', reason: '验证过', evidence: 'verified', sources: ['S1#1'] }],
+          skills: [],
+        }),
     });
     const seed = join(root, 'seed-knowledge');
     await git(root, ['clone', '-q', h.knowledgeRemote, seed]);
@@ -389,21 +374,14 @@ describe('DreamService', { timeout: TIMEOUT }, () => {
     await h.service.idle();
     const run = h.service.runs()[0]!;
     expect(run.status).toBe('succeeded');
-    expect(run.targets.map((t) => [t.repo, t.phase])).toEqual([
-      ['knowledge', 'published'],
-      ['knowledge:deep', 'published'],
-    ]);
-    expect(h.prompts.filter((prompt) => prompt.includes('<family>'))).toHaveLength(1);
-    const merged = await showFile(h.knowledgeRemote, 'main', 'notes/oc_team/build.md');
-    expect(merged).toContain('- [a00001] 全工程构建统一用 mvnd -T 10，并用全局锁包住');
-    expect(merged).toContain('- [a00002] 构建前先 install 上游模块');
-    expect(await showFile(h.knowledgeRemote, 'main', 'notes/oc_team_omt_x/build-tips.md')).toBe('');
+    // Raw notes are only ever appended to: the old per-chat merge is gone.
+    expect(h.prompts.filter((prompt) => prompt.includes('<family>'))).toHaveLength(0);
+    expect(await showFile(h.knowledgeRemote, 'main', 'notes/oc_team/build.md')).toContain('- [a00001] 全工程构建用 mvnd -T 10');
+    expect(await showFile(h.knowledgeRemote, 'main', 'notes/oc_team_omt_x/build-tips.md')).toContain('- [b00001] 构建要加全局锁');
     expect(await showFile(h.knowledgeRemote, 'main', 'notes/oc_team/deploy.md')).toContain('ship.md');
-    const changelog = await showFile(h.knowledgeRemote, 'main', 'CHANGELOG.md');
-    expect(changelog).toContain('· 深睡整理');
-    expect(changelog).toContain('笔记整合 `notes/oc_team/build.md` ← `oc_team/build`、`oc_team_omt_x/build-tips`（2 条）');
-    expect(await showFile(h.knowledgeRemote, 'main', 'DREAMS.md')).toContain('笔记整合：2 篇合成 1 篇，1 篇提升到主会话');
-    expect(run.diary).toContain('笔记整合：2 篇合成 1 篇');
+    // No manifest yet (the first full build goes through a PR): no digest either.
+    expect(await showFile(h.knowledgeRemote, 'main', 'notes/global/_manifest.json')).toBe('');
+    expect(run.diary).not.toContain('全局整合');
   });
 
   it('with publish: push, archives the notes nobody read or changed for a month', async () => {

@@ -22,3 +22,4 @@ web/dist/
 # Local maintenance scripts are not part of the package (root only: .github/scripts/ is tracked)
 /scripts/
 tests-smoke/
+.digest-build/

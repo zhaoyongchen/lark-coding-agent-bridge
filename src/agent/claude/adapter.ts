@@ -101,7 +101,10 @@ export class ClaudeAdapter implements AgentAdapter {
     return runWithAccountFailover(opts, {
       pool,
       spawn: (attemptOpts, account) => this.spawnRun(attemptOpts, account),
-      labelOf: (account) => (account.env.CLAUDE_CODE_OAUTH_TOKEN ? Promise.resolve(account.label) : claudeAccountName()),
+      // The CLI's own login shows the owner's label when one is set (`claude-account set default --label`),
+      // and only falls back to the name `claude auth status` reports.
+      labelOf: (account) =>
+        account.env.CLAUDE_CODE_OAUTH_TOKEN || account.label ? Promise.resolve(account.label) : claudeAccountName(),
     });
   }
 

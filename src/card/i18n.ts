@@ -74,6 +74,8 @@ export interface RunStrings {
   idleTimeout(minutes: number): string;
   agentFailed(message: string): string;
   noContent: string;
+  /** Under a finished answer while background tasks the agent started still run. */
+  backgroundRunning(n: number): string;
   noOutput: string;
   toolRunningBody: string;
   reasoningActive: string;
@@ -86,6 +88,7 @@ export interface RunStrings {
     paused: string;
     error: string;
     done: string;
+    backgroundRunning: string;
     toolRunning: string;
     streaming: string;
     thinking: string;
@@ -137,6 +140,7 @@ const zh: RunStrings = {
   idleTimeout: (m) => `_⏱ ${m} 分钟无响应,已自动终止_`,
   agentFailed: (msg) => `⚠️ agent 失败：${msg}`,
   noContent: '_（未返回内容）_',
+  backgroundRunning: (n) => `_⏳ 还有 ${n} 个后台任务在跑，这件事还没做完；出结果后会在这条消息下回复。_`,
   noOutput: '_无输出_',
   toolRunningBody: '_运行中…_',
   reasoningActive: '🧠 **思考中**',
@@ -149,6 +153,7 @@ const zh: RunStrings = {
     paused: '额度用完，已暂停',
     error: '出错',
     done: '已完成',
+    backgroundRunning: '后台任务还在跑',
     toolRunning: '正在调用工具',
     streaming: '正在输出',
     thinking: '思考中',
@@ -214,6 +219,8 @@ const en: RunStrings = {
   idleTimeout: (m) => `_⏱ No response for ${m} min, stopped automatically_`,
   agentFailed: (msg) => `⚠️ Agent failed: ${msg}`,
   noContent: '_(no content)_',
+  backgroundRunning: (n) =>
+    `_⏳ ${n} background task${n === 1 ? ' is' : 's are'} still running — not finished yet; the result will follow as a reply to this message._`,
   noOutput: '_no output_',
   toolRunningBody: '_running…_',
   reasoningActive: '🧠 **Thinking**',
@@ -226,6 +233,7 @@ const en: RunStrings = {
     paused: 'Paused: quota used up',
     error: 'Failed',
     done: 'Done',
+    backgroundRunning: 'Background tasks running',
     toolRunning: 'Running a tool',
     streaming: 'Writing',
     thinking: 'Thinking',

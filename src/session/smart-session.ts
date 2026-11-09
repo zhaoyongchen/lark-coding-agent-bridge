@@ -114,7 +114,7 @@ export function stripNewSessionMarker(text: string, streaming = false): string {
 export const SMART_SESSION_INSTRUCTION =
   '本会话开启了「会话智能压缩」：当你判断这件事已经彻底做完、后续大概率是新话题时，在最终回复的最后单独一行写 ' +
   '`[[NEW_SESSION: 一句话概括这段会话做了什么]]`，bridge 会在回复发出后归档当前会话（/resume 可找回），下一条消息从新会话开始。' +
-  '任务还没做完、用户可能追问、或你不确定时不要写。这个标记对用户不可见，不要在正文里提到它。';
+  '任务还没做完、还有后台任务没跑完、用户可能追问、或你不确定时不要写。这个标记对用户不可见，不要在正文里提到它。';
 
 /** Hand-off note prepended to the first prompt of the fresh session. */
 export function handoffSection(verdict: RotationVerdict): string {
@@ -129,14 +129,19 @@ export function handoffSection(verdict: RotationVerdict): string {
   });
 }
 
-/** One grey line under the answer telling the user the conversation was renewed. */
+/**
+ * One grey line at the top of the card telling the user this run started a
+ * fresh conversation. Everything in it is about the conversation left behind
+ * — said so outright, because under an answer 「上一件事已完成」 read as this
+ * run's task being done while its background work was still going.
+ */
 export function rotationNotice(verdict: RotationVerdict): string {
   const facts: string[] = [];
-  if (verdict.reason === 'agent-done') facts.push('上一件事已完成');
+  if (verdict.reason === 'agent-done') facts.push('上一段会话的事已做完');
   else if (verdict.idleMinutes !== undefined) facts.push(`上次对话在 ${humanIdle(verdict.idleMinutes)}前`);
-  if (verdict.contextTokens !== undefined) facts.push(`上下文约 ${humanTokens(verdict.contextTokens)} token`);
+  if (verdict.contextTokens !== undefined) facts.push(`旧会话上下文约 ${humanTokens(verdict.contextTokens)} token`);
   const why = facts.length > 0 ? `（${facts.join('，')}）` : '';
-  return `已自动开启新会话${why}，旧会话可用 /resume 找回`;
+  return `本轮从新会话开始${why}，旧会话可用 /resume 找回`;
 }
 
 export function humanIdle(minutes: number): string {

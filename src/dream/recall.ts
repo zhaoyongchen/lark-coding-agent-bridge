@@ -256,6 +256,11 @@ export class RecallStore {
       .map(([key]) => key);
   }
 
+  /** When a note (`note:<scope>/<topic>`) was first observed, if it has been. */
+  firstSeen(key: string): number | undefined {
+    return this.data.seen?.[key]?.first;
+  }
+
   item(key: string): RecallItem | undefined {
     return this.data.items[key];
   }

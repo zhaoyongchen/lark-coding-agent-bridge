@@ -171,4 +171,23 @@ describe('knowledge injection', () => {
     });
     expect(prompt).not.toContain('bridge_knowledge');
   });
+
+  it('puts the notes matching this message in a section of their own, after the knowledge block', () => {
+    const prompt = buildAgentPrompt({
+      context: { chatId: 'oc_group', chatType: 'group', senderId: 'ou_user', source: 'im' },
+      knowledge: { profileMemory: ['用中文回复'] },
+      relevantNotes: { notesDir: '/k/notes', notes: ['oc_group/ev-charger-generation'] },
+      userInput: '充电桩代次不对',
+    });
+    expect(prompt).toContain('<relevant_notes>');
+    expect(prompt).toContain('oc_group/ev-charger-generation');
+    expect(prompt.indexOf('</bridge_knowledge>')).toBeLessThan(prompt.indexOf('<relevant_notes>'));
+    expect(prompt.indexOf('<relevant_notes>')).toBeLessThan(prompt.indexOf('<user_input>'));
+    const none = buildAgentPrompt({
+      context: { chatId: 'oc_group', chatType: 'group', senderId: 'ou_user', source: 'im' },
+      relevantNotes: { notes: [] },
+      userInput: 'hi',
+    });
+    expect(none).not.toContain('relevant_notes');
+  });
 });

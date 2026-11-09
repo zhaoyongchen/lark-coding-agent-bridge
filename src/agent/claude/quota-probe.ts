@@ -1,8 +1,8 @@
 import { tmpdir } from 'node:os';
 import { runCapture } from '../../git/exec';
 import { log } from '../../core/logger';
-import type { ClaudeAccountPool, LineCap, PickedAccount } from './accounts';
-import { parseClaudeUsage, usageByKind } from './quota';
+import { FABLE_WINDOW, type ClaudeAccountPool, type LineCap, type PickedAccount } from './accounts';
+import { parseClaudeUsage, parseFableWeek, usageByKind } from './quota';
 import { translateEvent } from './stream-json';
 
 /**
@@ -14,8 +14,11 @@ export const QUOTA_FRESH_MS = 15 * 60_000;
 /** Accounts checked per run start at most: each check can take a few seconds. */
 const MAX_PROBES_PER_RUN = 3;
 const PROBE_TIMEOUT_MS = 30_000;
+/** `/accounts` reads every account afresh, except one a run or probe reported this recently. */
+export const ACCOUNTS_FRESH_MS = 60_000;
 
-export type QuotaProbe = (pool: ClaudeAccountPool, account: PickedAccount) => Promise<unknown>;
+/** Read one account's quota into the pool; false when the reading failed (void counts as read). */
+export type QuotaProbe = (pool: ClaudeAccountPool, account: PickedAccount) => Promise<boolean | void>;
 
 /**
  * Before a run: make sure the account it would get has a recent quota reading,
@@ -32,6 +35,9 @@ export async function refreshPickQuota(
   for (let i = 0; i < MAX_PROBES_PER_RUN; i++) {
     const account = pool.pick(undefined, opts.cap);
     if (!account) return;
+    // Its 5-hour window is over (so that one is empty) and the stagger opens
+    // the next; a probe would open it now. The run itself may still.
+    if (pool.heldForStagger(account.id, now())) return;
     const at = now();
     const seen = Math.max(pool.reportedAt(account.id) ?? 0, opts.checkedAt.get(account.id) ?? 0);
     if (at - seen < QUOTA_FRESH_MS) return;
@@ -40,6 +46,38 @@ export async function refreshPickQuota(
       log.warn('claude-accounts', 'quota-probe-failed', { id: account.id, err: String(err) }),
     );
   }
+}
+
+/**
+ * `/accounts`: read every account's quota as it is now, all at once, so the
+ * table and the switch scores it shows are current — not whatever each
+ * account's last run said, which can be hours or days old while the owners
+ * use their accounts elsewhere. Paused accounts are left out, and so is one
+ * reported within {@link ACCOUNTS_FRESH_MS}. Returns the ids whose reading
+ * failed (they keep their last report). Never throws.
+ */
+export async function refreshAllQuota(
+  pool: ClaudeAccountPool,
+  opts: { probe?: QuotaProbe; now?: () => number } = {},
+): Promise<string[]> {
+  const now = opts.now ?? Date.now;
+  const probe = opts.probe ?? probeAccountQuota;
+  const failed: string[] = [];
+  const stale = pool
+    .accounts()
+    .filter((account) => now() - (pool.reportedAt(account.id) ?? 0) >= ACCOUNTS_FRESH_MS)
+    // Probing every idle account at once is what bunched their resets up.
+    .filter((account) => !pool.heldForStagger(account.id, now()));
+  await Promise.all(
+    stale.map(async (account) => {
+      const ok = await probe(pool, account).catch((err: unknown) => {
+        log.warn('claude-accounts', 'quota-probe-failed', { id: account.id, err: String(err) });
+        return false;
+      });
+      if (ok === false) failed.push(account.id);
+    }),
+  );
+  return failed;
 }
 
 /**
@@ -54,14 +92,30 @@ export async function probeAccountQuota(pool: ClaudeAccountPool, account: Picked
     const result = await runCapture(binary, tmpdir(), ['-p', '/usage'], opts);
     const windows = result.ok ? parseClaudeUsage(result.stdout) : [];
     if (windows.length > 0) pool.observeUsage(account.id, usageByKind({ windows }));
+    const fable = result.ok ? parseFableWeek(result.stdout) : undefined;
+    if (fable) pool.observeModelWindow(account.id, FABLE_WINDOW, fable);
     log.info('claude-accounts', 'quota-probed', { id: account.id, via: 'usage', ok: windows.length > 0 });
     return windows.length > 0;
   }
+  return haikuProbe(pool, account, binary, 'haiku');
+}
+
+/**
+ * Open the account's next 5-hour window now (the window starts at the first
+ * request after the last one ran out): one tiny haiku request, also for the
+ * CLI's own login — its `/usage` read opens nothing. Records the quota the
+ * reply carries; true when it carried some.
+ */
+export function warmAccountWindow(pool: ClaudeAccountPool, account: PickedAccount, binary = 'claude'): Promise<boolean> {
+  return haikuProbe(pool, account, binary, 'warm');
+}
+
+async function haikuProbe(pool: ClaudeAccountPool, account: PickedAccount, binary: string, via: 'haiku' | 'warm'): Promise<boolean> {
   const result = await runCapture(
     binary,
     tmpdir(),
     ['-p', 'Reply with exactly: OK', '--output-format', 'stream-json', '--verbose', '--model', 'haiku', '--no-session-persistence'],
-    opts,
+    { timeoutMs: PROBE_TIMEOUT_MS, maxBytes: 256_000, env: account.env },
   );
   let seen = 0;
   for (const line of result.stdout.split('\n')) {
@@ -77,6 +131,6 @@ export async function probeAccountQuota(pool: ClaudeAccountPool, account: Picked
       seen++;
     }
   }
-  log.info('claude-accounts', 'quota-probed', { id: account.id, via: 'haiku', ok: seen > 0 });
+  log.info('claude-accounts', 'quota-probed', { id: account.id, via, ok: seen > 0 });
   return seen > 0;
 }

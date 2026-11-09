@@ -222,6 +222,7 @@ describe('RunExecutor background tasks', () => {
     expect(turns[0]).toEqual({
       kind: 'turn',
       events: [{ type: 'background', count: 0 }, { type: 'text', delta: 'build ok' }, done()],
+      background: 0,
     });
 
     live.exit();
@@ -312,6 +313,7 @@ describe('RunExecutor background tasks', () => {
     expect(turns[0]).toEqual({
       kind: 'turn',
       events: [{ type: 'account', label: 'shilong.wang' }, { type: 'text', delta: 'agent 1 done' }, done()],
+      background: 1,
     });
 
     // Still running when the linger cap hits: the stop notice names it too.
@@ -331,6 +333,28 @@ describe('RunExecutor background tasks', () => {
     expect(live.stopped).toBe(true);
     expect(live.sent).toEqual([]);
     expect(h.agent.runs).toHaveLength(2);
+  });
+
+  it('tells whoever waits on the background work that a replacing process stopped it', async () => {
+    const h = harness();
+    const turns: BackgroundTurn[] = [];
+    const first = await h.executor.submit({
+      scopeId: 'chat-1',
+      policy: policy(),
+      model: 'opus',
+      onBackgroundTurn: async (turn) => {
+        turns.push(turn);
+      },
+    });
+    const live = h.agent.runs[0]!;
+    live.emit({ type: 'system', sessionId: 'sess-1' }, { type: 'background', count: 2 }, done());
+    await collect(first.subscribe());
+    await until(() => h.activeRuns.isLingering('chat-1'));
+    expect(h.executor.backgroundTasks('chat-1')).toBe(2);
+
+    await h.executor.submit({ scopeId: 'chat-1', policy: policy(), model: 'sonnet', sessionId: 'sess-1' });
+    expect(turns).toEqual([{ kind: 'stopped', reason: 'replaced' }]);
+    expect(live.stopped).toBe(true);
   });
 
   it('spawns a fresh process when the next message resumes a different session', async () => {

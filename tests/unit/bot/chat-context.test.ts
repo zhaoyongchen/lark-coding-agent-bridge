@@ -43,6 +43,22 @@ describe('planChatContext', () => {
     });
   });
 
+  it('reads the conversation a prefix moved the message out of, on the first run in its topic', () => {
+    expect(planChatContext({ ...base, mode: 'topic', threadId: 'omt_1', hasSession: false, spawned: true })).toMatchObject({
+      container: 'chat',
+      containerId: 'oc_1',
+      window: 'parent_recent',
+      afterMs: UNTIL - CHAT_CONTEXT_LIMITS.recentWindowMs,
+      maxMessages: CHAT_CONTEXT_LIMITS.recentMessages,
+      excludeOwn: false,
+    });
+    // Later runs catch up in the topic like any other.
+    expect(
+      planChatContext({ ...base, mode: 'topic', threadId: 'omt_1', cursorMs: UNTIL - 5000, hasSession: true, spawned: true }),
+    ).toMatchObject({ container: 'thread', window: 'catch_up' });
+    expect(planChatContext({ ...base, mode: 'topic', threadId: 'omt_1', hasSession: true, spawned: true })).toBeUndefined();
+  });
+
   it('reads the whole topic, or the recent group timeline, on a first engagement', () => {
     expect(planChatContext({ ...base, mode: 'topic', threadId: 'omt_1', hasSession: false })).toMatchObject({
       window: 'topic_history',

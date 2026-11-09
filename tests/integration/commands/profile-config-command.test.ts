@@ -35,11 +35,12 @@ vi.mock('../../../src/utils/feishu-auth', () => ({
 }));
 
 vi.mock('../../../src/agent/claude/account', () => ({
-  claudeAccountName: vi.fn(async () => 'shilong.wang'),
+  claudeAccountName: Object.assign(vi.fn(async () => 'shilong.wang'), { latest: () => 'shilong.wang' }),
 }));
 
 const quotaProbeMocks = vi.hoisted(() => ({
   probeAccountQuota: vi.fn<(pool: ClaudeAccountPool, account: PickedAccount) => Promise<boolean>>(async () => false),
+  refreshAllQuota: vi.fn(async () => []),
 }));
 
 vi.mock('../../../src/agent/claude/quota-probe', () => quotaProbeMocks);

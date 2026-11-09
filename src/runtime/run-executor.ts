@@ -46,10 +46,13 @@ export interface RunExecutorDeps {
  * that the process was stopped with background work still running.
  */
 export type BackgroundTurn =
-  | { kind: 'turn'; events: AgentEvent[] }
+  /** `background`: tasks still running after this turn — 0 once the work is over. */
+  | { kind: 'turn'; events: AgentEvent[]; background: number }
   /** `account`: the subscription account the stopped process ran on, for the card. */
   | { kind: 'stopped'; reason: 'max-linger'; afterMs: number; account?: string }
-  | { kind: 'stopped'; reason: 'shutdown'; account?: string };
+  | { kind: 'stopped'; reason: 'shutdown'; account?: string }
+  /** The next message needed a process with other run options (model, effort, images…). */
+  | { kind: 'stopped'; reason: 'replaced'; account?: string };
 
 export type BackgroundTurnHandler = (turn: BackgroundTurn) => Promise<void>;
 
@@ -243,7 +246,13 @@ export class RunExecutor {
           previous.session.detachTurn();
         }
       }
-      if (!live) await this.retire(previous, compatible ? 'input-closed' : 'incompatible');
+      if (!live) {
+        // Stopping it ends the background work too: whoever is waiting on it hears so.
+        if (!compatible && previous.session.background > 0 && !previous.session.hasExited) {
+          await this.notify(previous, { kind: 'stopped', reason: 'replaced', ...accountOf(previous) });
+        }
+        await this.retire(previous, compatible ? 'input-closed' : 'incompatible');
+      }
     }
 
     let run: AgentRun;
@@ -395,6 +404,11 @@ export class RunExecutor {
     return Boolean(live && !live.finishing && !live.session.hasExited);
   }
 
+  /** Background tasks `scopeId`'s live process last reported running; 0 without one. */
+  backgroundTasks(scopeId: string): number {
+    return this.hasLiveProcess(scopeId) ? (this.live.get(scopeId)?.session.background ?? 0) : 0;
+  }
+
   /**
    * Close `scopeId`'s process now if it is only being kept idle for a next
    * turn — for one-shot internal runs (课堂精练) that will never have one.
@@ -524,7 +538,7 @@ export class RunExecutor {
       events: events.length,
       background: live.session.background,
     });
-    void this.notify(live, { kind: 'turn', events }).then(async () => {
+    void this.notify(live, { kind: 'turn', events, background: live.session.background }).then(async () => {
       if (live.session.background > 0 || live.session.hasAttachedTurn || live.session.hasExited) return;
       // No background work left: wait idle for the next message where the
       // agent supports it, otherwise make sure the process goes away (the

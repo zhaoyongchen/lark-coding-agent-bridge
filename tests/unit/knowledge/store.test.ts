@@ -253,3 +253,20 @@ describe('rankNotes', () => {
     expect(store.rankNotes(notes).map((note) => note.name)).toEqual(['oc_1/a', 'oc_1/b', 'oc_1/c']);
   });
 });
+
+describe('noteCreatedAt', () => {
+  it('takes the earlier of the file birth time and when 课堂精练 first saw the note', async () => {
+    await mkdir(join(store.dir, 'notes', 'oc_1'), { recursive: true });
+    await writeFile(join(store.dir, 'notes', 'oc_1', 'a.md'), 'a');
+    const [note] = await store.listNotes(['oc_1']);
+    expect(note?.createdAt).toBeGreaterThan(0);
+    expect(store.noteCreatedAt()(note!)).toBe(note!.createdAt);
+    store.setNoteFirstSeen(() => (name) => (name === 'oc_1/a' ? 1_000 : undefined));
+    expect(store.noteCreatedAt()(note!)).toBe(1_000);
+    expect(store.noteCreatedAt()({ name: 'oc_1/b', path: '/x' })).toBeUndefined();
+    store.setNoteFirstSeen(() => {
+      throw new Error('boom');
+    });
+    expect(store.noteCreatedAt()(note!)).toBe(note!.createdAt);
+  });
+});

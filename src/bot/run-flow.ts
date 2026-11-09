@@ -20,7 +20,7 @@ import type { GateContext } from '../runtime/approvals';
 import { RunRejected, type RunRejectedCode } from '../runtime/errors';
 import { sessionHasKnowledge, type AgentSessionProbe } from '../agent/session-probe';
 import { log } from '../core/logger';
-import { effortPrefForChat, type SmartSessionSettings } from '../config/schema';
+import { effortPrefForChat, type EffortLevel, type SmartSessionSettings } from '../config/schema';
 import type { SessionCatalog } from '../session/catalog';
 import {
   decideRotation,
@@ -62,8 +62,9 @@ export interface StartRunFlowInput {
    * The prompt's `<bridge_knowledge>` section (`full`, exactly as in the
    * prompt) and the stub that replaces it when the conversation the run
    * resumes still holds this `version` in full (agents that can tell).
+   * `onFull` is called when the full block goes out instead.
    */
-  knowledge?: { version: string; full: string; stub: string };
+  knowledge?: { version: string; full: string; stub: string; onFull?: () => void };
   /**
    * 会话智能压缩 (IM only): may leave the conversation this message would
    * resume and start fresh. Leave unset to always resume.
@@ -80,6 +81,12 @@ export interface StartRunFlowInput {
     source: string;
     stage: string;
   };
+  /**
+   * 自动分级: the run's model / effort, settled once the conversation it
+   * resumes is known (`resumeFrom` undefined: a new one). Undefined fields,
+   * or no result, keep the profile's.
+   */
+  pickLevel?: (resumeFrom: string | undefined) => Promise<{ model?: string; effort?: EffortLevel } | undefined>;
 }
 
 export type RunFlowRejectCode =
@@ -205,9 +212,13 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     const { full, stub } = input.knowledge;
     runPolicy = { ...runPolicy, prompt: runPolicy.prompt.replace(full, () => stub) };
     log.info('knowledge', 'stub', { scope: input.scopeId, version: input.knowledge.version, savedChars: full.length - stub.length });
+  } else if (input.knowledge && runPolicy.prompt.includes(input.knowledge.full)) {
+    input.knowledge.onFull?.();
   }
   const sessionId = descriptor.sessionHandle === 'sessionId' ? resumeFrom : undefined;
   const threadId = descriptor.sessionHandle === 'threadId' ? resumeFrom : undefined;
+
+  const level = input.pickLevel ? await input.pickLevel(resumeFrom).catch(() => undefined) : undefined;
 
   let execution: RunExecution;
   try {
@@ -218,11 +229,11 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       threadId,
       model: resolveModelArg(
         input.profileConfig.agentKind,
-        input.profileConfig.preferences.model,
+        level?.model ?? input.profileConfig.preferences.model,
       ),
       effort: resolveEffortArg(
         input.profileConfig.agentKind,
-        effortPrefForChat(input.profileConfig.preferences, input.scope.chatId),
+        level?.effort ?? effortPrefForChat(input.profileConfig.preferences, input.scope.chatId),
       ),
       images:
         descriptor.imageArgs

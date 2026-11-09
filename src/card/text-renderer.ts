@@ -1,7 +1,7 @@
 import { maskEmails } from './mask-email';
 import { runStrings, type Locale, type RunStrings } from './i18n';
 import { pauseNotice } from './pause-notice';
-import type { Block, RunState, ToolEntry } from './run-state';
+import { backgroundLeft, type Block, type RunState, type ToolEntry } from './run-state';
 import { toolHeaderText } from './tool-render';
 
 /**
@@ -34,6 +34,8 @@ export function renderText(state: RunState, locale?: Locale): string {
   } else if (state.terminal === 'running' && state.footer) {
     parts.push(footerLine(state.footer, t));
   }
+  const background = backgroundLeft(state);
+  if (background > 0) parts.push(t.backgroundRunning(background));
 
   // Strip raw emails so the Feishu tenant audit doesn't reject the message
   // (see mask-email.ts). Never removes content, so emptiness checks upstream

@@ -93,7 +93,9 @@ describe('hand-off and notice', () => {
   it('explains the renewal in one line', () => {
     expect(rotationNotice({ reason: 'idle-large', idleMinutes: 180, contextTokens: 450_000 })).toContain('3 小时前');
     expect(rotationNotice({ reason: 'idle-large', idleMinutes: 180, contextTokens: 450_000 })).toContain('45 万');
-    expect(rotationNotice({ reason: 'agent-done' })).toContain('上一件事已完成');
+    expect(rotationNotice({ reason: 'agent-done' })).toContain('上一段会话的事已做完');
+    expect(rotationNotice({ reason: 'agent-done' })).not.toContain('上一件事已完成');
+    expect(rotationNotice({ reason: 'agent-done', contextTokens: 160_000 })).toMatch(/^本轮从新会话开始（.*旧会话上下文约 16 万 token）/);
     expect(rotationNotice({ reason: 'idle-long', idleMinutes: 3 * 24 * 60 })).toContain('3 天前');
   });
 });

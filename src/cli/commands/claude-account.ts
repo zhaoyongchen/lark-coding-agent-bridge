@@ -7,6 +7,9 @@ import {
   bestSwitchTarget,
   claudeAccountsPaths,
   findAccountRow,
+  findPausedAccount,
+  pausedNote,
+  pausedRefusal,
   switchToAccount,
   ClaudeAccountPool,
   deleteAccount,
@@ -17,8 +20,15 @@ import {
   saveAccount,
   updateAccount,
   updateDefaultLines,
+  updateOffDayLines,
+  offDayNote,
+  updateStagger,
   type SwitchLines,
+  parseNicknameMood,
+  type NicknameMood,
 } from '../../agent/claude/accounts';
+import { currentStaggerPlan } from '../../agent/claude/window-stagger';
+import { staggerNote } from '../../agent/account';
 import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
 import { promptPassword } from '../prompt';
 import { resolveSecretProfilePaths } from './secrets';
@@ -43,7 +53,9 @@ export async function runClaudeAccountList(opts: AccountCliOptions = {}): Promis
   console.log(
     `# profile ${appPaths.profile} 的 Claude 账户（按优先顺序；默认切换线 5 小时 ${lines.five_hour}% · 本周 ${lines.seven_day}%）\n`,
   );
-  for (const line of accountsReport(pool, await claudeAccountName())) console.log(line.replace(/\*\*/g, ''));
+  const offDay = offDayNote(pool);
+  if (offDay) console.log(`${offDay}\n`);
+  for (const line of accountsReport(pool, await claudeAccountName(), Date.now(), { private: true })) console.log(line.replace(/\*\*/g, ''));
   if (!pool.multi) {
     console.log('\n只有 CLI 自己的登录。添加备用账户：先用备用账户执行 `claude setup-token`，再运行');
     console.log(`  lark-channel-bridge claude-account add <id> --label <名字> --profile ${appPaths.profile}`);
@@ -100,19 +112,39 @@ interface LineOptions {
   weekly?: string;
 }
 
+/** `高兴=大王` / `happy=大王` pairs → names by mood; exits on a bad mood. */
+function parseNicknameOptions(pairs: string[]): Partial<Record<NicknameMood, string>> | undefined {
+  if (pairs.length === 0) return undefined;
+  const out: Partial<Record<NicknameMood, string>> = {};
+  for (const pair of pairs) {
+    const at = pair.indexOf('=');
+    const mood = at > 0 ? parseNicknameMood(pair.slice(0, at)) : undefined;
+    if (!mood) {
+      console.error(`✗ --nickname 要写成 <心情>=<称呼>，心情是 高兴/兴奋/难过/委屈（或 happy/excited/sad/wronged）：${pair}`);
+      process.exit(1);
+    }
+    out[mood] = pair.slice(at + 1);
+  }
+  return out;
+}
+
 export async function runClaudeAccountSet(
   id: string,
-  opts: AccountCliOptions & LineOptions & { label?: string },
+  opts: AccountCliOptions & LineOptions & { label?: string; nickname?: string[]; clearNicknames?: boolean },
 ): Promise<void> {
   const lines = parseLineOptions(opts, true);
-  if (opts.label === undefined && !lines) {
-    console.error('✗ 至少给一项：--label <名字>、--five-hour <百分比>、--weekly <百分比>（0 表示跟默认）');
+  const nicknames = parseNicknameOptions(opts.nickname ?? []);
+  if (opts.label === undefined && !lines && !nicknames && !opts.clearNicknames) {
+    console.error(
+      '✗ 至少给一项：--label <名字>、--nickname <心情>=<称呼>、--clear-nicknames、--five-hour <百分比>、--weekly <百分比>（0 表示跟默认）',
+    );
     process.exit(1);
   }
   const appPaths = await resolveSecretProfilePaths(opts);
   await updateAccount(claudeAccountsPaths(appPaths.profileDir), id, {
     ...(opts.label !== undefined ? { label: opts.label } : {}),
     ...(lines ? { lines } : {}),
+    ...(opts.clearNicknames ? { nicknames: null } : nicknames ? { nicknames } : {}),
   });
   console.log(`✓ 已更新账户 ${id}，运行中的 bridge 下一次运行前生效\n`);
   await runClaudeAccountList(opts);
@@ -128,6 +160,34 @@ export async function runClaudeAccountLines(opts: AccountCliOptions & LineOption
   const appPaths = await resolveSecretProfilePaths(opts);
   await updateDefaultLines(claudeAccountsPaths(appPaths.profileDir), lines);
   console.log('✓ 已更新默认切换线，运行中的 bridge 下一次运行前生效\n');
+  await runClaudeAccountList(opts);
+}
+
+/** Rest-day lines and near-reset spans for every account (`0` drops one). */
+export async function runClaudeAccountOffDay(
+  opts: AccountCliOptions & LineOptions & { fiveHourGrace?: string; weeklyGrace?: string },
+): Promise<void> {
+  const lines = parseLineOptions(opts, true) ?? {};
+  const grace: Partial<SwitchLines> = {};
+  for (const [kind, raw] of [
+    ['five_hour', opts.fiveHourGrace],
+    ['seven_day', opts.weeklyGrace],
+  ] as const) {
+    if (raw === undefined) continue;
+    const value = Number(raw.trim().replace(/h$/i, ''));
+    if (!Number.isFinite(value) || value < 0 || value > 168) {
+      console.error(`✗ 临近重置时长要是 0–168 小时（0 表示去掉）：${raw}`);
+      process.exit(1);
+    }
+    grace[kind] = value;
+  }
+  if (Object.keys(lines).length === 0 && Object.keys(grace).length === 0) {
+    console.error('✗ 至少给一项：--five-hour、--weekly、--five-hour-grace、--weekly-grace');
+    process.exit(1);
+  }
+  const appPaths = await resolveSecretProfilePaths(opts);
+  await updateOffDayLines(claudeAccountsPaths(appPaths.profileDir), lines, grace);
+  console.log('✓ 已更新休息日规则，运行中的 bridge 下一次运行前生效\n');
   await runClaudeAccountList(opts);
 }
 
@@ -154,7 +214,7 @@ export async function runClaudeAccountSwitch(
   const pool = new ClaudeAccountPool({ paths });
   await pool.refresh();
   const label = await claudeAccountName();
-  const rows = accountRows(pool, label);
+  const rows = accountRows(pool, label, Date.now(), { private: true });
   let line: number | undefined;
   if (opts.line !== undefined) {
     line = Number(opts.line.trim().replace(/%$/, ''));
@@ -164,6 +224,11 @@ export async function runClaudeAccountSwitch(
     }
   }
   const target = query ? findAccountRow(rows, query) : bestSwitchTarget(rows);
+  const paused = query && !target ? findPausedAccount(pool, query) : undefined;
+  if (paused) {
+    console.error(`✗ 没有切换：${paused.name}（${paused.id}）${pausedRefusal(paused.until)}；要提前恢复用 claude-account resume ${paused.id}`);
+    process.exit(1);
+  }
   if (!target) {
     console.error(query ? `✗ 没有叫「${query}」的账户` : '✗ 其他账户都已到切换线或额度用尽，暂时没有可切换的');
     process.exit(1);
@@ -181,7 +246,79 @@ export async function runClaudeAccountSwitch(
   console.log(
     `✓ 已把 ${target.name}（${target.id}）设为主账户${query ? '，到切换线之前不会自动换走' : ''}${boost ? `，切换线临时调到 ${line}%，该窗口重置后恢复` : ''}，运行中的 bridge 下一次运行前生效\n`,
   );
-  console.log(accountsTable(accountRows(pool, label)).replace(/\*\*/g, ''));
+  console.log(accountsTable(accountRows(pool, label, Date.now(), { private: true })).replace(/\*\*/g, ''));
+  const note = pausedNote(pool, { private: true });
+  if (note) console.log(`\n${note}`);
+}
+
+/**
+ * Take an account out of rotation until a date (`--until 2026-11-13`, local
+ * midnight; or `2026-11-13T09:00`) or for some days (`--days 14`). Runs
+ * already on it move at their next message; it comes back on its own.
+ */
+export async function runClaudeAccountPause(
+  id: string,
+  opts: AccountCliOptions & { until?: string; days?: string },
+): Promise<void> {
+  const until = parsePauseUntil(opts);
+  if (typeof until === 'string') {
+    console.error(`✗ ${until}`);
+    process.exit(1);
+  }
+  const appPaths = await resolveSecretProfilePaths(opts);
+  await updateAccount(claudeAccountsPaths(appPaths.profileDir), id, { pausedUntil: until });
+  console.log(`✓ 已暂停账户 ${id} 到 ${new Date(until).toLocaleString('zh-CN', { hour12: false })}，到期自动恢复；运行中的 bridge 下一次运行前生效\n`);
+  await runClaudeAccountList(opts);
+}
+
+/** End a pause now. */
+export async function runClaudeAccountResume(id: string, opts: AccountCliOptions = {}): Promise<void> {
+  const appPaths = await resolveSecretProfilePaths(opts);
+  await updateAccount(claudeAccountsPaths(appPaths.profileDir), id, { pausedUntil: null });
+  console.log(`✓ 已恢复账户 ${id}，运行中的 bridge 下一次运行前生效\n`);
+  await runClaudeAccountList(opts);
+}
+
+/** `stagger [on|off]`: turn the 5-hour window stagger on or off, then show the plan. */
+export async function runClaudeAccountStagger(state: string | undefined, opts: AccountCliOptions = {}): Promise<void> {
+  const appPaths = await resolveSecretProfilePaths(opts);
+  const paths = claudeAccountsPaths(appPaths.profileDir);
+  if (state !== undefined) {
+    if (state !== 'on' && state !== 'off') {
+      console.error('✗ 用法：claude-account stagger [on|off]');
+      process.exit(1);
+    }
+    await updateStagger(paths, state === 'on');
+    console.log(`✓ 5 小时窗口错峰已${state === 'on' ? '开启' : '关闭'}，运行中的 bridge 10 分钟内生效\n`);
+  }
+  const pool = new ClaudeAccountPool({ paths });
+  await pool.refresh();
+  if (!pool.staggerEnabled) {
+    console.log('5 小时窗口错峰：关（窗口由运行自然打开）。开启：claude-account stagger on');
+    return;
+  }
+  const rows = accountRows(pool, await claudeAccountName(), Date.now(), { private: true });
+  const note = staggerNote(currentStaggerPlan(pool), rows);
+  console.log(note ? note.replace(/\*\*/g, '') : '只有一个可用账户，不需要错峰。');
+}
+
+/** `--until 2026-11-13` (local midnight) / `2026-11-13T09:00`, or `--days 14`: epoch ms in the future, else why not. */
+export function parsePauseUntil(opts: { until?: string; days?: string }, now = Date.now()): number | string {
+  if ((opts.until === undefined) === (opts.days === undefined)) return '--until <日期> 和 --days <天数> 二选一';
+  let until: number;
+  if (opts.days !== undefined) {
+    const days = Number(opts.days.trim());
+    if (!Number.isFinite(days) || days <= 0) return `天数要是正数：${opts.days}`;
+    until = now + days * 86_400_000;
+  } else {
+    const raw = opts.until!.trim();
+    // A bare date is local midnight, not UTC midnight as Date.parse reads it.
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+    until = match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).getTime() : Date.parse(raw);
+    if (!Number.isFinite(until)) return `日期看不懂：${opts.until}（例：2026-11-13 或 2026-11-13T09:00）`;
+  }
+  if (until <= now) return '暂停截止时间要在将来';
+  return until;
 }
 
 /** `--five-hour 98` / `--weekly 90%`; `0` (when allowed) drops an account's own line. Anything else exits. */

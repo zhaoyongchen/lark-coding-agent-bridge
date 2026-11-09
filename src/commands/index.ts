@@ -1697,7 +1697,11 @@ async function handlePlanQuota(ctx: CommandContext): Promise<void> {
     await reply(ctx, `❌ 读取额度失败：${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  const accounts = await agentAccountsReport(ctx.controls.profileConfig, commandProfilePaths(ctx).profileDir);
+  const accounts = await agentAccountsReport(
+    ctx.controls.profileConfig,
+    commandProfilePaths(ctx).profileDir,
+    accountNameView(ctx),
+  );
   const body = usageMarkdown(parseClaudeUsage(raw), raw);
   const card = usageCard(
     accounts ? [`**CLI 登录账户**`, body, '', ...accounts, '_各账户用量取自它最近一次运行的报告。_'].join('\n') : body,
@@ -1706,6 +1710,16 @@ async function handlePlanQuota(ctx: CommandContext): Promise<void> {
 }
 
 // ─── /accounts ────────────────────────────────────────────────────────────
+
+/**
+ * Accounts go by the owner's private names only in the owner's own DM: the
+ * owner asked for them to stay out of every chat others can read (2026-11-06).
+ */
+function accountNameView(ctx: CommandContext): { private: boolean } {
+  return {
+    private: ctx.msg.chatType === 'p2p' && Boolean(ctx.controls.botOwnerId) && ctx.msg.senderId === ctx.controls.botOwnerId,
+  };
+}
 
 /**
  * The profile's Claude subscription accounts: `/accounts` lists them as a
@@ -1717,12 +1731,15 @@ async function handleAccounts(args: string, ctx: CommandContext): Promise<void> 
   const profileDir = commandProfilePaths(ctx).profileDir;
   try {
     if (sub === '' || sub === 'list') {
-      const table = await agentAccountsTable(ctx.controls.profileConfig, profileDir);
+      const table = await agentAccountsTable(ctx.controls.profileConfig, profileDir, accountNameView(ctx));
       await reply(ctx, table ?? '`/accounts` 目前只支持 Claude profile。');
       return;
     }
     if (sub === 'switch' || sub === '切换') {
-      await reply(ctx, await switchAgentAccount(ctx.controls.profileConfig, profileDir, rest.join(' ')));
+      await reply(
+        ctx,
+        await switchAgentAccount(ctx.controls.profileConfig, profileDir, rest.join(' '), accountNameView(ctx)),
+      );
       return;
     }
   } catch (err) {

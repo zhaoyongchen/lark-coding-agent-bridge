@@ -22,11 +22,12 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../../../src/agent/claude/account', () => ({
-  claudeAccountName: vi.fn(async () => 'shilong.wang'),
+  claudeAccountName: Object.assign(vi.fn(async () => 'shilong.wang'), { latest: () => 'shilong.wang' }),
 }));
 
 vi.mock('../../../src/agent/claude/quota-probe', () => ({
   probeAccountQuota: mocks.probe,
+  refreshAllQuota: vi.fn(async () => []),
 }));
 
 const HOUR = 3_600_000;

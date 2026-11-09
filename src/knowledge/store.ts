@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { writeFileAtomic } from '../platform/atomic-write';
+import { DigestManifestReader, type DigestView } from './digest';
 
 /**
  * Bridge-managed knowledge for one profile: what the bot should remember, and
@@ -42,6 +43,19 @@ export interface SkillSource {
   listSkills(): Promise<SkillSummary[]>;
 }
 
+/** A topic note on disk: name `<scope>/<topic>`, and when the file was first written (epoch ms). */
+export interface NoteFile {
+  name: string;
+  path: string;
+  createdAt?: number;
+}
+
+/** Counts of how often notes were shown to the agent (`NoteExposure`). */
+export interface NoteExposureTracker {
+  shown(): (name: string) => number;
+  record(names: readonly string[]): void;
+}
+
 /** Bullet lines look like `- [a1b2c3] remember this`. */
 const ENTRY_RE = /^-\s*\[([0-9a-f]{6})\]\s*(.*)$/;
 
@@ -49,9 +63,23 @@ export class KnowledgeStore {
   readonly dir: string;
   private readonly skillSources: SkillSource[] = [];
   private noteRanker: (() => (name: string) => number) | undefined;
+  private noteFirstSeen: (() => (name: string) => number | undefined) | undefined;
+  private noteExposure: NoteExposureTracker | undefined;
+  private digestReader: DigestManifestReader | undefined;
 
   constructor(dir: string = paths.knowledgeDir) {
     this.dir = dir;
+  }
+
+  /** The 全局知识整合层 manifest as of now (see `./digest`). */
+  digestView(): Promise<DigestView> {
+    this.digestReader ??= new DigestManifestReader(this.dir);
+    return this.digestReader.view();
+  }
+
+  /** {@link digestView} as last read, synchronously (for rankers). */
+  cachedDigestView(): DigestView | undefined {
+    return this.digestReader?.last();
   }
 
   /** Merge another source's skills behind this profile's own (`/skills lib`). */
@@ -67,8 +95,8 @@ export class KnowledgeStore {
    * Topic notes (`notes/<scope>/<topic>.md`, written by 课堂精练) of these
    * scopes, name `<scope>/<topic>`. Only real files inside the directory.
    */
-  async listNotes(scopeIds: readonly string[]): Promise<Array<{ name: string; path: string }>> {
-    const out: Array<{ name: string; path: string }> = [];
+  async listNotes(scopeIds: readonly string[]): Promise<NoteFile[]> {
+    const out: NoteFile[] = [];
     for (const scope of [...new Set(scopeIds.map(sanitizeScopeId))]) {
       const dir = join(this.dir, 'notes', scope);
       let entries;
@@ -78,7 +106,11 @@ export class KnowledgeStore {
         continue;
       }
       for (const entry of entries.filter((item) => item.isFile() && /^[a-z0-9][a-z0-9-]*\.md$/.test(item.name)).sort((a, b) => a.name.localeCompare(b.name))) {
-        out.push({ name: `${scope}/${entry.name.slice(0, -3)}`, path: join(dir, entry.name) });
+        const path = join(dir, entry.name);
+        const info = await stat(path).catch(() => undefined);
+        // Birth time where the file system keeps one; dream edits notes in place, so it stays the day the note was written.
+        const createdAt = info ? (info.birthtimeMs > 0 ? info.birthtimeMs : info.mtimeMs) : undefined;
+        out.push({ name: `${scope}/${entry.name.slice(0, -3)}`, path, ...(createdAt !== undefined ? { createdAt } : {}) });
       }
     }
     return out;
@@ -111,8 +143,64 @@ export class KnowledgeStore {
     this.noteRanker = ranker;
   }
 
-  /** Notes ordered by {@link setNoteRank}, highest first; ties keep their order. */
-  rankNotes<T extends { name: string }>(notes: readonly T[]): T[] {
+  /**
+   * When 课堂精练 first saw a note (`<scope>/<topic>`), if it has. A note
+   * rewritten whole gets a new file, so its birth time alone would make it new again.
+   */
+  setNoteFirstSeen(lookup: (() => (name: string) => number | undefined) | undefined): void {
+    this.noteFirstSeen = lookup;
+  }
+
+  /**
+   * How often a note (`<scope>/<topic>`) has been shown to the agent in the
+   * index (see `NoteExposure`): the least shown take the exploration share.
+   */
+  setNoteExposure(tracker: NoteExposureTracker | undefined): void {
+    this.noteExposure = tracker;
+  }
+
+  /** Each note's {@link setNoteExposure} count as of now; all 0 when none is set. */
+  noteExposures(): (name: string) => number {
+    let shown: ((name: string) => number) | undefined;
+    try {
+      shown = this.noteExposure?.shown();
+    } catch {
+      shown = undefined;
+    }
+    return (name) => (shown ? safeRank(shown, name) : 0);
+  }
+
+  /** These notes were just listed to the agent in a full knowledge block. */
+  recordNoteExposure(names: readonly string[]): void {
+    try {
+      this.noteExposure?.record(names);
+    } catch (err) {
+      log.warn('knowledge', 'exposure-record-failed', { err: String(err) });
+    }
+  }
+
+  /** When a note was first written: the earlier of its file's birth time and when 课堂精练 first saw it. */
+  noteCreatedAt(): (note: NoteFile) => number | undefined {
+    let seen: ((name: string) => number | undefined) | undefined;
+    try {
+      seen = this.noteFirstSeen?.();
+    } catch {
+      seen = undefined;
+    }
+    return (note) => {
+      let first: number | undefined;
+      try {
+        first = seen?.(note.name);
+      } catch {
+        first = undefined;
+      }
+      const times = [note.createdAt, first].filter((at): at is number => typeof at === 'number' && Number.isFinite(at));
+      return times.length > 0 ? Math.min(...times) : undefined;
+    };
+  }
+
+  /** Notes ordered by {@link setNoteRank}, highest first (`asc`: lowest first); ties keep their order. */
+  rankNotes<T extends { name: string }>(notes: readonly T[], order: 'desc' | 'asc' = 'desc'): T[] {
     let rank: ((name: string) => number) | undefined;
     try {
       rank = this.noteRanker?.();
@@ -121,7 +209,8 @@ export class KnowledgeStore {
     }
     if (!rank) return [...notes];
     const score = new Map(notes.map((note) => [note.name, safeRank(rank, note.name)]));
-    return [...notes].sort((a, b) => (score.get(b.name) ?? 0) - (score.get(a.name) ?? 0));
+    const sign = order === 'asc' ? -1 : 1;
+    return [...notes].sort((a, b) => sign * ((score.get(b.name) ?? 0) - (score.get(a.name) ?? 0)));
   }
 
   memoryFile(scope: MemoryScope): string {

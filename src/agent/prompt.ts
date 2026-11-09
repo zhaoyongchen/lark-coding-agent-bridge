@@ -59,11 +59,14 @@ export interface BridgePromptContextMessage {
  *   own replies left out — they're in the session).
  * - `topic_history`: the topic so far, on the bot's first run in it.
  * - `recent`: the group's latest messages, on the bot's first run there.
+ * - `parent_recent`: the latest messages of the conversation a topic prefix
+ *   (`/xhigh …`) moved the message out of, on the first run in its topic.
  */
-export type BridgePromptChatContextWindow = 'catch_up' | 'topic_history' | 'recent';
+export type BridgePromptChatContextWindow = 'catch_up' | 'topic_history' | 'recent' | 'parent_recent';
 
 export interface BridgePromptChatContext {
-  scope: 'topic' | 'group';
+  /** Where the messages were read: a topic, a group's main flow, or a private chat's. */
+  scope: 'topic' | 'group' | 'p2p';
   window: BridgePromptChatContextWindow;
   /** Older or longer content was left out to stay within limits. */
   truncated?: boolean;
@@ -107,6 +110,8 @@ export interface BuildAgentPromptInput {
   instructions?: string[];
   userInput: string;
   knowledge?: BridgePromptKnowledge;
+  /** Notes that match this message's words (`findRelevantNotes`), apart from the versioned index. */
+  relevantNotes?: { notesDir?: string; notes: string[] };
   chatContext?: BridgePromptChatContext;
   quotedMessages?: BridgePromptQuotedMessage[];
   interactiveCards?: BridgePromptInteractiveCard[];
@@ -121,6 +126,9 @@ export function buildAgentPrompt(input: BuildAgentPromptInput): string {
       ? promptSection('bridge_instructions', input.instructions)
       : undefined,
     input.knowledge ? promptSection('bridge_knowledge', input.knowledge) : undefined,
+    input.relevantNotes && input.relevantNotes.notes.length > 0
+      ? promptSection('relevant_notes', input.relevantNotes)
+      : undefined,
     input.chatContext && input.chatContext.messages.length > 0
       ? promptSection('chat_context', input.chatContext)
       : undefined,

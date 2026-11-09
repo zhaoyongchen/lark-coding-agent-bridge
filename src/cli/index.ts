@@ -5,9 +5,13 @@ import { formatAgentPreflightDiagnostic, getAgentPreflightDiagnostic } from '../
 import {
   runClaudeAccountAdd,
   runClaudeAccountLines,
+  runClaudeAccountOffDay,
   runClaudeAccountList,
   runClaudeAccountOrder,
+  runClaudeAccountPause,
   runClaudeAccountRemove,
+  runClaudeAccountResume,
+  runClaudeAccountStagger,
   runClaudeAccountSet,
   runClaudeAccountSwitch,
 } from './commands/claude-account';
@@ -313,12 +317,30 @@ claudeAccount
   .command('set <id>')
   .description("Change an account's name or switch lines (0 follows the default) without re-entering its token")
   .option('--label <name>', 'name shown as the reply card Sponsor')
+  .option(
+    '--nickname <mood=name>',
+    "owner-only name by mood (高兴/兴奋/难过/委屈 or happy/excited/sad/wronged), repeatable; empty name drops it",
+    (value: string, prev: string[] = []) => [...prev, value],
+  )
+  .option('--clear-nicknames', 'drop all owner-only names')
   .option('--five-hour <percent>', '5-hour window switch line; 0 for the default')
   .option('--weekly <percent>', 'weekly window switch line; 0 for the default')
   .option('--profile <name>', 'profile name (defaults to active profile)')
-  .action(async (id: string, opts: { label?: string; fiveHour?: string; weekly?: string; profile?: string }) => {
-    await runClaudeAccountSet(id, opts);
-  });
+  .action(
+    async (
+      id: string,
+      opts: {
+        label?: string;
+        nickname?: string[];
+        clearNicknames?: boolean;
+        fiveHour?: string;
+        weekly?: string;
+        profile?: string;
+      },
+    ) => {
+      await runClaudeAccountSet(id, opts);
+    },
+  );
 
 claudeAccount
   .command('lines')
@@ -329,6 +351,22 @@ claudeAccount
   .action(async (opts: { fiveHour?: string; weekly?: string; profile?: string }) => {
     await runClaudeAccountLines(opts);
   });
+
+claudeAccount
+  .command('off-day')
+  .description(
+    'Rest-day (weekend / statutory holiday) rules for every account: lines raised to these, and longer near-reset spans in hours; 0 drops one',
+  )
+  .option('--five-hour <percent>', '5-hour window switch line on rest days')
+  .option('--weekly <percent>', 'weekly window switch line on rest days')
+  .option('--five-hour-grace <hours>', 'on rest days the 5-hour window counts as about to reset this many hours before (5 = always)')
+  .option('--weekly-grace <hours>', 'on rest days the weekly window counts as about to reset this many hours before')
+  .option('--profile <name>', 'profile name (defaults to active profile)')
+  .action(
+    async (opts: { fiveHour?: string; weekly?: string; fiveHourGrace?: string; weeklyGrace?: string; profile?: string }) => {
+      await runClaudeAccountOffDay(opts);
+    },
+  );
 
 claudeAccount
   .command('order <ids...>')
@@ -347,6 +385,32 @@ claudeAccount
   .option('--profile <name>', 'profile name (defaults to active profile)')
   .action(async (id: string | undefined, opts: { profile?: string; line?: string }) => {
     await runClaudeAccountSwitch(id, { profile: opts.profile, ...(opts.line !== undefined ? { line: opts.line } : {}) });
+  });
+
+claudeAccount
+  .command('pause <id>')
+  .description('Take an account out of rotation until a date or for some days; it comes back on its own')
+  .option('--until <date>', 'resume on this date (2026-11-13 is local midnight; 2026-11-13T09:00 also works)')
+  .option('--days <n>', 'resume after this many days')
+  .option('--profile <name>', 'profile name (defaults to active profile)')
+  .action(async (id: string, opts: { until?: string; days?: string; profile?: string }) => {
+    await runClaudeAccountPause(id, opts);
+  });
+
+claudeAccount
+  .command('resume <id>')
+  .description('End a pause now')
+  .option('--profile <name>', 'profile name (defaults to active profile)')
+  .action(async (id: string, opts: { profile?: string }) => {
+    await runClaudeAccountResume(id, { profile: opts.profile });
+  });
+
+claudeAccount
+  .command('stagger [state]')
+  .description('Show the 5-hour window stagger plan; `on` / `off` turns it on or off')
+  .option('--profile <name>', 'profile name (defaults to active profile)')
+  .action(async (state: string | undefined, opts: { profile?: string }) => {
+    await runClaudeAccountStagger(state, { profile: opts.profile });
   });
 
 claudeAccount

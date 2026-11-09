@@ -12,7 +12,8 @@ import { maskSecrets } from './secrets';
  * 课前学习: before a run reads its own conversations, it studies what changed
  * in the external repositories the owner pointed it at — other bots' knowledge
  * and skill libraries. They are cloned read-only into the run's scratch space
- * and never written to; only Markdown is read, newest change since the last
+ * and never written to; only Markdown and HTML (as plain text — ops teams
+ * often keep their incident reports as HTML) is read, newest change since the last
  * run's commit first, within a character budget. What does not fit stays
  * `pending` for the next run, so a large first read is spread over several.
  */
@@ -49,6 +50,15 @@ const CLONE_TIMEOUT_MS = 120_000;
 const FETCH_DEPTH = '50';
 const MAX_FILE_BYTES = 200_000;
 export const MAX_EXTERNAL_FILE_CHARS = 12_000;
+
+/**
+ * Where reading starts: the library's cursor, else its configured `since`
+ * commit (content up to there was studied another way), else nowhere — all of it.
+ */
+export function startingCursor(library: DreamExternalLibraryConfig, cursor: ExternalCursor | undefined): ExternalCursor | undefined {
+  if (cursor) return cursor;
+  return library.since ? { commit: library.since, learnedAt: 0 } : undefined;
+}
 
 /** Bring `dir` to the library's latest remote commit. Never merges, never pushes. */
 export async function fetchExternalLibrary(
@@ -136,8 +146,10 @@ export async function collectExternalMaterial(input: {
       pending.push(path);
       continue;
     }
-    const text = await readInside(dir, path);
-    if (text === undefined) continue;
+    const raw = await readInside(dir, path);
+    if (raw === undefined) continue;
+    const text = isHtml(path) ? htmlToText(raw) : raw;
+    if (!text.trim()) continue;
     const masked = maskSecrets(text);
     const room = Math.min(MAX_EXTERNAL_FILE_CHARS, input.budget - used);
     if (masked.length > room && files.length > 0 && room < MAX_EXTERNAL_FILE_CHARS) {
@@ -182,8 +194,38 @@ export function describeExternal(library: DreamExternalLibraryConfig): string {
 }
 
 function isStudyFile(path: string): boolean {
-  if (!/\.md$/i.test(path)) return false;
+  if (!/\.md$/i.test(path) && !isHtml(path)) return false;
   return !path.split('/').some((part) => part.startsWith('.'));
+}
+
+function isHtml(path: string): boolean {
+  return /\.html?$/i.test(path);
+}
+
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+/**
+ * The readable text of an HTML page: scripts, styles and inline SVG dropped,
+ * block ends as line breaks, table cells as ` | `, entities decoded, blank
+ * runs collapsed. Good enough to study a report, not a renderer.
+ */
+export function htmlToText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style|svg|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<br\s*\/?>|<\/(p|div|li|tr|h[1-6]|table|section|article|header|footer|pre|blockquote|dt|dd|caption|figure)\s*>/gi, '\n')
+    .replace(/<\/t[dh]\s*>/gi, ' | ')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, name: string) => {
+      if (name[0] === '#') {
+        const code = name[1] === 'x' || name[1] === 'X' ? Number.parseInt(name.slice(2), 16) : Number.parseInt(name.slice(1), 10);
+        return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+      }
+      return ENTITIES[name.toLowerCase()] ?? whole;
+    })
+    .replace(/[ \t\f\v\u00a0]+/g, ' ')
+    .replace(/ *\n[\s]*/g, '\n')
+    .trim();
 }
 
 /** Skills first, then the knowledge files, READMEs last. */

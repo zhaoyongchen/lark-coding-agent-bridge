@@ -24,6 +24,8 @@ describe('每日模式 settings', () => {
         { name: 'cc-knowledge', url: 'git@github.com:dup/dup.git' },
         { name: '../bad', url: 'git@github.com:x/y.git' },
         { name: 'cc-skills', url: 'git@github.com:mirsery/lark-bot-skills.git', ref: 'main' },
+        { name: 'ops', url: 'git@github.com:x/ops.git', since: 'F47E336' },
+        { name: 'ops-bad', url: 'git@github.com:x/ops-bad.git', since: 'main; rm -rf' },
       ],
     });
     expect(settings.auto.daily).toEqual({ at: 240, text: '04:00' });
@@ -33,8 +35,10 @@ describe('每日模式 settings', () => {
     expect(settings.requireArgumentHint).toBe(true);
     expect(settings.notifyChat).toBe('oc_abc');
     expect(settings.localSkillDirs).toEqual(['~/.claude/skills']);
-    expect(settings.external.map((item) => item.name)).toEqual(['cc-knowledge', 'cc-skills']);
+    expect(settings.external.map((item) => item.name)).toEqual(['cc-knowledge', 'cc-skills', 'ops', 'ops-bad']);
     expect(settings.external[1]).toMatchObject({ ref: 'main' });
+    expect(settings.external[2]).toMatchObject({ since: 'f47e336' });
+    expect(settings.external[3]).not.toHaveProperty('since');
   });
 
   it('falls back to the defaults for anything malformed', () => {

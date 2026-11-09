@@ -11,6 +11,13 @@ export type TenantBrand = 'feishu' | 'lark';
  *   - `file`: value is at the path `id` (or `provider.path` if provider config)
  *   - `exec`: spawn `provider.command`, send JSON over stdin, read JSON from stdout
  */
+export interface AutoTopicPreference {
+  /** Only these chats; empty or absent means every chat. */
+  chats?: string[];
+  /** Never these chats. */
+  exceptChats?: string[];
+}
+
 export interface SecretRef {
   source: 'env' | 'file' | 'exec';
   provider?: string;
@@ -156,6 +163,30 @@ export interface AppPreferences {
    * `/config` still edits the profile-wide value.
    */
   chatEffort?: Record<string, EffortLevel>;
+  /**
+   * 自动分级 (chat runs only): rate each message with a quick model call and
+   * move the run's model / effort one rung at a time along a ladder. For
+   * runs the owner didn't start, the chat's effort (`chatEffort`, else
+   * `effort`) caps the climb. Config-file only; see src/agent/auto-effort.ts.
+   * Default off.
+   */
+  autoEffort?: AutoEffortPreference;
+  /**
+   * 前缀开话题: a message opening with `/new-topic` or a 自动分级 rung
+   * (`/xhigh 帮我…`) outside a topic gets a topic of its own, opened under
+   * the message, and runs there. `false` keeps it in the conversation it was
+   * sent to. Config-file only. Default on (rung names need `autoEffort`).
+   */
+  topicPrefix?: boolean;
+  /**
+   * 自动开话题: every message from a person outside a topic gets a topic of
+   * its own, opened under the message, as if it had opened with `/new-topic`.
+   * `true` for every chat; `{ chats }` for only those chats; `exceptChats`
+   * leaves those chats where they are. A follow-up to a run going on in the
+   * conversation (补充/追加/+, quote-reply) still folds into that run, and
+   * bots' messages stay put. Config-file only. Default off.
+   */
+  autoTopic?: boolean | AutoTopicPreference;
   /**
    * Whether to send a separate Lark COT process message before the final
    * answer. `brief` mirrors the lightweight tool/progress visibility from
@@ -365,6 +396,17 @@ export interface DreamTuning {
   skillLibrary?: string;
   /** Only these chat / topic scopes. Absent: every chat scope. */
   scopes?: string[];
+  /**
+   * Never read these chats (a chat id covers all its topics): a project kept in
+   * its own private repository. Applied after {@link scopes}.
+   */
+  excludeScopes?: string[];
+  /**
+   * Reject any note, memory or skill whose text, reason or body contains one of
+   * these (case-insensitive) — keeps a separately stored project out of the
+   * shared libraries. Pool candidates that match are dropped too.
+   */
+  excludeTerms?: string[];
   /** 自动整理: hours a run may start in, `HH:MM-HH:MM` (may wrap midnight). Default `01:00-07:00`. */
   window?: string;
   /** IANA time zone of {@link window}. Default: the host's. */
@@ -459,6 +501,13 @@ export interface DreamExternalLibraryConfig {
   url: string;
   /** Branch to follow; absent: the remote's default branch. */
   ref?: string;
+  /**
+   * Commit (7–40 hex digits) to start from while the library has no cursor
+   * yet: only what changed after it is read. For a library whose existing
+   * content was already studied by hand; once a run moves the cursor this
+   * is ignored. Unknown to the fetched history: everything is read.
+   */
+  since?: string;
 }
 
 export interface DreamAutoSettings {
@@ -489,6 +538,10 @@ export interface DreamSettings {
   minIdleMinutes: number;
   skillLibrary?: string;
   scopes?: string[];
+  /** See {@link DreamTuning.excludeScopes}. */
+  excludeScopes: string[];
+  /** See {@link DreamTuning.excludeTerms}. */
+  excludeTerms: string[];
   publish: 'pr' | 'push';
   skillUpdates: 'pr' | 'push';
   external: DreamExternalLibraryConfig[];
@@ -525,6 +578,8 @@ export const DREAM_DEFAULTS: DreamSettings = {
   maxRunMinutes: 20,
   drainRounds: 6,
   minIdleMinutes: 30,
+  excludeScopes: [],
+  excludeTerms: [],
   publish: 'pr',
   skillUpdates: 'pr',
   external: [],
@@ -535,6 +590,20 @@ export const DREAM_DEFAULTS: DreamSettings = {
   localClones: [],
   auto: DREAM_AUTO_DEFAULTS,
 };
+
+/** `preferences.autoEffort` as written in the config file; resolved by `resolveAutoEffort`. */
+export interface AutoEffortPreference {
+  enabled?: boolean;
+  /** Bottom to top. Default: opus·medium, opus·high, opus·xhigh, fable·xhigh (owner only). */
+  ladder?: Array<{ label: string; model: string; effort: EffortLevel; ownerOnly?: boolean; hint?: string; quotaWindow?: string }>;
+  /** Model and effort of the rating call. Default `opus` / `medium`. */
+  classifierModel?: string;
+  classifierEffort?: EffortLevel;
+  /** Give up on the rating after this long and keep the current rung. Default 20000. */
+  timeoutMs?: number;
+  /** A rung whose `quotaWindow` (Fable: its own weekly window) is this full on the run's account is skipped. Default 90. */
+  quotaLine?: number;
+}
 
 export interface SmartSessionTuning {
   /** Idle this long with a large context starts a fresh session. Default 60. */
@@ -792,9 +861,11 @@ export function resolveDreamSettings(tuning: DreamTuning | undefined): DreamSett
   const pick = (value: unknown, min: number, max: number, fallback: number): number =>
     typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? Math.floor(value) : fallback;
   const library = typeof raw.skillLibrary === 'string' ? raw.skillLibrary.trim() : '';
-  const scopes = Array.isArray(raw.scopes)
-    ? raw.scopes.filter((scope): scope is string => typeof scope === 'string' && scope.trim() !== '').map((scope) => scope.trim())
-    : [];
+  const strings = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim() !== '').map((item) => item.trim())
+      : [];
+  const scopes = strings(raw.scopes);
   const daily = typeof raw.dailyAt === 'string' ? parseDreamClock(raw.dailyAt) : undefined;
   const resetBefore = typeof raw.quotaResetBefore === 'string' ? parseDreamClock(raw.quotaResetBefore) : undefined;
   const notifyChat = typeof raw.notifyChat === 'string' && /^o[cu]_[\w-]+$/.test(raw.notifyChat.trim()) ? raw.notifyChat.trim() : '';
@@ -806,6 +877,8 @@ export function resolveDreamSettings(tuning: DreamTuning | undefined): DreamSett
     minIdleMinutes: pick(raw.minIdleMinutes, 0, 7 * 24 * 60, DREAM_DEFAULTS.minIdleMinutes),
     ...(library ? { skillLibrary: library } : {}),
     ...(scopes.length > 0 ? { scopes } : {}),
+    excludeScopes: strings(raw.excludeScopes),
+    excludeTerms: strings(raw.excludeTerms),
     publish: raw.publish === 'push' ? 'push' : 'pr',
     skillUpdates: raw.skillUpdates === 'pr' || raw.skillUpdates === 'push' ? raw.skillUpdates : raw.publish === 'push' ? 'push' : 'pr',
     external: resolveExternalLibraries(raw.externalLibraries),
@@ -866,7 +939,7 @@ function resolveExternalLibraries(raw: unknown): DreamExternalLibraryConfig[] {
   const out: DreamExternalLibraryConfig[] = [];
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue;
-    const { name, url, ref } = item as Partial<DreamExternalLibraryConfig>;
+    const { name, url, ref, since } = item as Partial<DreamExternalLibraryConfig>;
     if (typeof name !== 'string' || !EXTERNAL_NAME_RE.test(name.trim())) continue;
     if (typeof url !== 'string' || !url.trim() || /\s/.test(url.trim())) continue;
     if (out.some((entry) => entry.name === name.trim())) continue;
@@ -874,6 +947,7 @@ function resolveExternalLibraries(raw: unknown): DreamExternalLibraryConfig[] {
       name: name.trim(),
       url: url.trim(),
       ...(typeof ref === 'string' && ref.trim() ? { ref: ref.trim() } : {}),
+      ...(typeof since === 'string' && /^[0-9a-f]{7,40}$/i.test(since.trim()) ? { since: since.trim().toLowerCase() } : {}),
     });
   }
   return out;

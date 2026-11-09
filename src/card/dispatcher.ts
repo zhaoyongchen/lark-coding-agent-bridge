@@ -25,6 +25,29 @@ import { lookupMessageThreadId } from '../bot/thread-id';
 const BRIDGE_CALLBACK_MARKER = '__bridge_cb';
 const LEGACY_CLAUDE_CALLBACK_MARKER = '__claude_cb';
 
+/** Marker on buttons a skill's script put on its own card (antelope:deploy's
+ * confirm / cancel), whose value is the skill name. These are clicked long
+ * after the run that sent the card has ended, so there is no run to sign a
+ * token against; the click goes to the agent unsigned, as the clicker, and
+ * the skill re-checks who clicked against its own state (the deploy script
+ * only lets the plan's operator confirm it). To keep a forged card from
+ * smuggling instructions in under someone else's name, the value may only
+ * carry a few short identifier fields — no free text.
+ */
+const SKILL_CALLBACK_MARKER = '__skill_cb';
+const SKILL_NAME = /^[a-z0-9-]{1,40}:[a-z0-9-]{1,40}$/;
+const SKILL_FIELD_KEY = /^[a-z_]{1,32}$/;
+const SKILL_FIELD_VALUE = /^[A-Za-z0-9_.:,/@-]{1,120}$/;
+const SKILL_MAX_FIELDS = 6;
+/** A skill card may also be a form (antelope:deploy's branch picker: one
+ * checkbox per branch plus a launch-order box). Its values ride along under
+ * form_value with the same no-free-text rule: keys are short identifiers,
+ * values are booleans, short identifier strings (spaces allowed, for a list
+ * of numbers) or arrays of those. */
+const SKILL_FORM_KEY = /^[a-z0-9_]{1,32}$/;
+const SKILL_FORM_VALUE = /^[A-Za-z0-9_.:,/@ -]{0,120}$/;
+const SKILL_FORM_MAX_FIELDS = 40;
+
 export interface CardDispatchDeps {
   channel: LarkChannel;
   evt: CardActionEvent;
@@ -65,10 +88,10 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // session — look up the carrier message (the card lives on it) once.
   // Done before the access check so we know the chat mode (p2p vs group)
   // and can skip the chat allowlist for DMs.
-  const { scope, threadId, mode } = await resolveScope(deps);
+  const { scope, threadId, mode, isP2p } = await resolveScope(deps);
 
   const accessDecision =
-    mode === 'p2p'
+    isP2p
       ? canUseDm(deps.controls.profileConfig, deps.controls, operatorId)
       : canUseGroup(deps.controls.profileConfig, deps.controls, chatId, operatorId);
   if (!accessDecision.ok) {
@@ -81,6 +104,27 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
 
   if (LEGACY_CLAUDE_CALLBACK_MARKER in payload) {
     log.info('cardAction', 'skip-legacy-callback-marker', { scope });
+    return;
+  }
+
+  if (SKILL_CALLBACK_MARKER in payload) {
+    const click = skillClick(payload);
+    if (!click) {
+      log.warn('cardAction', 'skip-bad-skill-callback', {
+        scope,
+        payload: JSON.stringify(payload).slice(0, 200),
+      });
+      return;
+    }
+    const form = formValue === undefined ? undefined : skillForm(formValue);
+    if (form === null) {
+      log.warn('cardAction', 'skip-bad-skill-form', {
+        scope,
+        form: JSON.stringify(formValue).slice(0, 200),
+      });
+      return;
+    }
+    forwardToAgent(deps, click, form, scope, threadId, isP2p);
     return;
   }
 
@@ -146,7 +190,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // as a follow-up message, with full context of what it sent.
   if (BRIDGE_CALLBACK_MARKER in payload) {
     if (!verifyBridgeToken(deps, payload, scope, 'agent_callback')) return;
-    forwardToAgent(deps, payload, formValue, scope, threadId, mode);
+    forwardToAgent(deps, payload, formValue, scope, threadId, isP2p);
     return;
   }
 
@@ -155,22 +199,26 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
 
 async function resolveScope(
   deps: CardDispatchDeps,
-): Promise<{ scope: string; threadId: string | undefined; mode: 'p2p' | 'group' | 'topic' }> {
+): Promise<{
+  scope: string;
+  threadId: string | undefined;
+  mode: 'p2p' | 'group' | 'topic';
+  isP2p: boolean;
+}> {
   const chatId = deps.evt.chatId;
   const mode = await deps.chatModeCache.resolve(deps.channel, chatId);
-  if (mode === 'p2p') {
-    return { scope: chatId, threadId: undefined, mode };
-  }
+  const isP2p = mode === 'p2p';
   // Match message intake: a carrier thread_id is stronger than cached chat
-  // mode (groups converted to topics can still resolve as ordinary groups).
-  // One API call per click; could cache by messageId if it ever becomes hot.
+  // mode (groups converted to topics can still resolve as ordinary groups,
+  // and DMs have topics too — /new-topic opens them). One API call per
+  // click; could cache by messageId if it ever becomes hot.
   const threadId = await lookupMessageThreadId(deps.channel, deps.evt.messageId);
   if (!threadId) {
     // Fall back to plain chatId. Better to land in the chat's "default"
     // scope than fail the click silently.
-    return { scope: chatId, threadId: undefined, mode };
+    return { scope: chatId, threadId: undefined, mode, isP2p };
   }
-  return { scope: `${chatId}:${threadId}`, threadId, mode: 'topic' };
+  return { scope: `${chatId}:${threadId}`, threadId, mode: 'topic', isP2p };
 }
 
 function forwardToAgent(
@@ -179,7 +227,7 @@ function forwardToAgent(
   formValue: Record<string, unknown> | undefined,
   scope: string,
   threadId: string | undefined,
-  mode: 'p2p' | 'group' | 'topic',
+  isP2p: boolean,
 ): void {
   // Strip the marker so the agent only sees the meaningful fields it set.
   const {
@@ -195,7 +243,7 @@ function forwardToAgent(
   const synthetic: NormalizedMessage = {
     messageId: deps.evt.messageId,
     chatId: deps.evt.chatId,
-    chatType: mode === 'p2p' ? 'p2p' : 'group',
+    chatType: isP2p ? 'p2p' : 'group',
     threadId,
     senderId: deps.evt.operator.openId,
     senderName: deps.evt.operator.name,
@@ -255,6 +303,42 @@ function mayStopRun(deps: CardDispatchDeps, scope: string, operatorId: string): 
     operatorId,
     running.supplement?.initiators,
   ).ok;
+}
+
+/** `{__skill_cb: 'antelope:deploy', action: 'confirm', plan: '…'}` →
+ * `{skill: 'antelope:deploy', action: 'confirm', plan: '…'}`, or undefined
+ * when the value is anything but a skill name plus a few short identifiers
+ * (or also carries a command or bridge-callback fields). */
+function skillClick(payload: Record<string, unknown>): Record<string, string> | undefined {
+  const { [SKILL_CALLBACK_MARKER]: skill, ...fields } = payload;
+  if (typeof skill !== 'string' || !SKILL_NAME.test(skill)) return undefined;
+  if ('cmd' in fields || 'skill' in fields || isSignedBridgeCallback(fields)) return undefined;
+  const entries = Object.entries(fields);
+  if (entries.length === 0 || entries.length > SKILL_MAX_FIELDS) return undefined;
+  const click: Record<string, string> = { skill };
+  for (const [key, value] of entries) {
+    if (!SKILL_FIELD_KEY.test(key) || typeof value !== 'string' || !SKILL_FIELD_VALUE.test(value)) {
+      return undefined;
+    }
+    click[key] = value;
+  }
+  return click;
+}
+
+/** The form values of a skill card, or null when any of them is free text,
+ * too long, or not a boolean / short identifier (see SKILL_FORM_VALUE). */
+function skillForm(form: Record<string, unknown>): Record<string, unknown> | null {
+  const entries = Object.entries(form);
+  if (entries.length > SKILL_FORM_MAX_FIELDS) return null;
+  const okValue = (v: unknown): boolean =>
+    typeof v === 'boolean' || (typeof v === 'string' && SKILL_FORM_VALUE.test(v));
+  for (const [key, value] of entries) {
+    if (!SKILL_FORM_KEY.test(key)) return null;
+    if (Array.isArray(value) ? value.length > SKILL_FORM_MAX_FIELDS || !value.every(okValue) : !okValue(value)) {
+      return null;
+    }
+  }
+  return form;
 }
 
 function isSignedBridgeCallback(payload: Record<string, unknown>): boolean {

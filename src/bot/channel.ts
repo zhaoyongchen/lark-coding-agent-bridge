@@ -4,9 +4,9 @@ import type {
   LarkChannelOptions,
   NormalizedMessage,
 } from '@larksuite/channel';
-import { createLarkChannel, LarkChannelError } from '@larksuite/channel';
+import { createLarkChannel, LarkChannelError, normalize } from '@larksuite/channel';
 import { dirname, join } from 'node:path';
-import { agentAccountName } from '../agent/account';
+import { agentAccountName, startAgentWindowStagger } from '../agent/account';
 import { agentCapability } from '../agent/capability';
 import {
   modelLabel,
@@ -34,9 +34,10 @@ import { fitCardToBudget, fullText } from '../card/card-budget';
 import { detectLocale, runStrings, type Locale } from '../card/i18n';
 import { withoutOffLocaleProgress } from '../card/progress-language';
 import { runningToolLabel } from '../card/run-activity';
-import { renderCard } from '../card/run-renderer';
+import { renderCard, renderTopicOpenerCard } from '../card/run-renderer';
 import type { RunActivity, RunCardRenderOptions } from '../card/run-renderer';
 import {
+  backgroundLeft,
   finalizeIfRunning,
   initialState,
   reduce,
@@ -65,6 +66,9 @@ import {
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
 import { tmpdir } from 'node:os';
+import { AutoEffortStore, resolveAutoEffort } from '../agent/auto-effort';
+import { claudeAccountPool } from '../agent/claude/accounts';
+import { autoEffortByline, startAutoEffort, type AutoEffortPick, type AutoEffortPlan } from './auto-effort-flow';
 import { overloadCard } from '../card/templates';
 import { botOwnersOf, BotOverloadGuard, isBotOnlyBatch, isOverloadExempt } from './bot-overload';
 import { log, redactDiagnosticText, reportMetric, withTrace } from '../core/logger';
@@ -124,7 +128,9 @@ import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { reportInterruptedRuns } from './interrupted-notice';
 import { RunRegistry } from '../runtime/run-registry';
-import { buildKnowledgeContext, knowledgeStub, nativeSkillOption } from '../knowledge/inject';
+import { buildKnowledgeContext, knowledgeStub, listedNoteNames, nativeSkillOption } from '../knowledge/inject';
+import { NoteExposure } from '../knowledge/exposure';
+import { findRelevantNotes, type RelevantNotes } from '../knowledge/relevance';
 import { writeKnowledgeSnapshot } from '../knowledge/snapshot';
 import { getKnowledgeSyncIntervalMinutes, KnowledgeAutoSync } from '../knowledge/auto-sync';
 import { getSkillSyncIntervalMinutes, SkillLibraries } from '../knowledge/libraries';
@@ -148,20 +154,53 @@ import { fetchQuotedContext, type QuotedContext } from './quote';
 import { ChatContextCursorStore, fetchChatContext, planChatContext } from './chat-context';
 import { lookupMessageThreadId } from './thread-id';
 import {
+  isSpawnedTopic,
+  markSpawnedTopic,
+  matchTopicPrefix,
+  autoTopicEnabled,
+  autoTopicPrefix,
+  type TopicPrefix,
+  openTopicUnder,
+  topicOpenedText,
+  topicRunText,
+} from './topic-prefix';
+import { adoptCardStream, holdTopicOpener, releaseTopicOpener, takeTopicOpener, topicOpenedNoticeCard } from './topic-opener';
+import {
   addDoneReaction,
   addSupplementReaction,
   addWorkingReaction,
   removeReaction,
 } from './reaction';
 import {
-  maySupplement,
+  otherSupplementInstruction,
   SUPPLEMENT_INSTRUCTION,
   supplementPreview,
+  supplementRole,
   supplementSignal,
 } from './supplement';
 import { applyRecall, parseRecallEvent, RECALL_EVENT, RecalledMessages, settleEarlyRecalls } from './recall';
+import {
+  EDIT_EVENT,
+  type EditEvent,
+  EditedMessages,
+  editInstruction,
+  editPreview,
+  editSupplementInstruction,
+  isEdited,
+  markEdited,
+  parseEditEvent,
+  runForMessage,
+} from './edit';
 import { mediaPlaceholders } from './media-placeholders';
 import { planLongRunNotice, sendLongRunNotice, type LongRunRequester } from './long-run-notice';
+import {
+  BackgroundOrigins,
+  backgroundTasksInstruction,
+  messagePreview,
+  settleBackgroundOrigins,
+  type BackgroundOrigin,
+  type ResultLocation,
+} from './background-origins';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -338,8 +377,16 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const knowledge = deps.appPaths?.knowledgeDir
     ? new KnowledgeStore(deps.appPaths.knowledgeDir)
     : undefined;
+  // How often each note was listed to the agent: the index shows the least shown in turn.
+  const noteExposure = knowledge && deps.appPaths?.knowledgeDir
+    ? new NoteExposure(join(dirname(deps.appPaths.knowledgeDir), 'note-exposure.json'))
+    : undefined;
   if (knowledge) {
     controls.knowledge = knowledge;
+    if (noteExposure) {
+      await noteExposure.load();
+      knowledge.setNoteExposure({ shown: () => noteExposure.asOf(Date.now()), record: (names) => noteExposure.record(names) });
+    }
     // Create the skeleton up front so `/skills` has a directory to point at and
     // `/knowledge bind` has something to commit.
     await knowledge.ensure().catch((err: unknown) =>
@@ -451,6 +498,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const pendingRotations = new PendingRotationStore(deps.appPaths?.rotationsFile);
   await pendingRotations.load();
   controls.pendingRotations = pendingRotations;
+  // Messages whose run answered while background tasks still ran (see BackgroundOrigins).
+  const backgroundOrigins = new BackgroundOrigins();
+  // 自动分级: each scope's rung on the effort ladder, on disk across restarts.
+  const autoEfforts = new AutoEffortStore(
+    deps.appPaths?.profileDir ? join(deps.appPaths.profileDir, 'auto-effort.json') : undefined,
+  );
+  await autoEfforts.load();
   // 复制代码: finished cards' copy buttons carry a key into this store.
   if (deps.appPaths?.mediaDir) {
     const codeSnippets = new CodeSnippetStore(join(dirname(deps.appPaths.mediaDir), 'code-snippets.json'));
@@ -587,6 +641,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           activePolicyFingerprints,
           lastRunModelByScope,
           pendingRotations,
+          backgroundOrigins,
           contextCursors,
           scope,
           mode,
@@ -595,8 +650,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           botOverload,
           activeRuns,
           recalled,
+          autoEfforts,
           ...(knowledge ? { knowledge } : {}),
-          ...(deps.appPaths?.profileDir ? { knowledgeSnapshotDir: join(deps.appPaths.profileDir, 'knowledge-snapshots') } : {}),
+          ...(deps.appPaths?.profileDir
+            ? {
+                knowledgeSnapshotDir: join(deps.appPaths.profileDir, 'knowledge-snapshots'),
+                profileDir: deps.appPaths.profileDir,
+              }
+            : {}),
         });
       } catch (err) {
         log.fail('flush', err);
@@ -605,6 +666,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           log.fail('flush', notifyErr, { step: 'notify-failed' }),
         );
       } finally {
+        // A topic opener card no run took over (another reply mode, a rejected batch…) turns back into the notice.
+        await releaseTopicOpener(channel, scope);
         pending.unblock(scope);
         log.info('flush', 'end');
       }
@@ -776,6 +839,41 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     });
   } else {
     log.warn('recall', 'hook-unavailable', { reason: 'channel 不支持 onRawEvent' });
+  }
+
+  // 消息被编辑: rides the same connection as the recall events above, and
+  // likewise only arrives once the app subscribes to "消息被编辑" in the
+  // developer console.
+  const edits = new EditedMessages();
+  if (typeof channel.onRawEvent === 'function') {
+    channel.onRawEvent(EDIT_EVENT, async (raw) => {
+      const evt = parseEditEvent(raw);
+      if (!evt) {
+        log.warn('edit', 'unparsed', {});
+        return;
+      }
+      await withTrace({ chatId: evt.chatId, msgId: evt.messageId }, () =>
+        intakeEdit({
+          evt,
+          edits,
+          channel,
+          agent,
+          sessions,
+          sessionCatalog,
+          workspaces,
+          activeRuns,
+          pending,
+          media,
+          controls,
+          chatModeCache,
+          logThreadModeOverride,
+          executor,
+          pool,
+          autoResumer,
+          recalled,
+        }),
+      ).catch((err) => log.fail('edit', err));
+    });
   }
 
   // In-meeting agent. Created before connect() so the `vc.bot.*` handlers are
@@ -963,6 +1061,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     },
   }) : undefined;
 
+  // Claude accounts: keep their 5-hour windows evenly staggered.
+  const windowStagger = deps.appPaths?.profileDir
+    ? startAgentWindowStagger(controls.profileConfig, deps.appPaths.profileDir)
+    : undefined;
+
   // Knowledge repo auto-sync (`/knowledge bind`): a no-op until the directory
   // is bound to a remote; first round shortly after start-up, then every
   // `knowledge.syncIntervalMinutes`. Repeated failures reach the owner's DM.
@@ -984,6 +1087,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
       await worktreeCleanup?.stop();
+      await windowStagger?.stop();
       // Side by side: each gives its in-flight git a few seconds at most.
       await Promise.all([skillLibraries?.stop(), knowledgeAutoSync?.stop()]);
       controls.skillLibraries = undefined;
@@ -1331,15 +1435,49 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // User tasks come first: an automatic 课堂精练 still drafting stops here.
   deps.controls.dream?.preempt('有新的用户消息');
 
+  // 前缀开话题: `/xhigh 帮我…` outside a topic runs in a topic of its own,
+  // opened under the message itself — not in this conversation, and not as a
+  // supplement to a run going on in it.
+  const stays = resolvedMode === 'topic' || Boolean(deps.recalled?.has(emsg.messageId));
+  let routed = stays ? undefined : await routeTopicPrefix(channel, controls, emsg, scope);
+  // 自动开话题: any other message from a person gets a topic too — unless it
+  // follows up on a run going on right here, which it joins instead.
+  if (
+    !routed &&
+    !stays &&
+    !emsg.threadId &&
+    senderTypeOf(emsg) !== 'bot' &&
+    autoTopicEnabled(controls.profileConfig.preferences.autoTopic, emsg.chatId)
+  ) {
+    if (
+      await tryInjectSupplement({
+        channel,
+        activeRuns,
+        media,
+        controls,
+        msg: emsg,
+        scope,
+        mode: chatMode,
+        ...(deps.recalled ? { recalled: deps.recalled } : {}),
+      })
+    ) {
+      return;
+    }
+    routed = await openTopicFor(channel, emsg, scope, autoTopicPrefix(emsg.content ?? ''));
+  }
+  const runMsg = routed?.msg ?? emsg;
+  const runScope = routed?.scope ?? scope;
+  const runMode: ChatMode = routed ? 'topic' : chatMode;
+
   if (
     await tryInjectSupplement({
       channel,
       activeRuns,
       media,
       controls,
-      msg: emsg,
-      scope,
-      mode: chatMode,
+      msg: runMsg,
+      scope: runScope,
+      mode: runMode,
       ...(deps.recalled ? { recalled: deps.recalled } : {}),
     })
   ) {
@@ -1347,20 +1485,148 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   }
 
   // Recalled while intake was still resolving it.
-  if (deps.recalled?.has(emsg.messageId)) {
-    log.info('intake', 'skip-recalled', { scope, msgId: emsg.messageId });
+  if (deps.recalled?.has(runMsg.messageId)) {
+    log.info('intake', 'skip-recalled', { scope: runScope, msgId: runMsg.messageId });
+    await releaseTopicOpener(channel, runScope);
     return;
   }
-  const size = pending.push(scope, emsg);
-  log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+  const size = pending.push(runScope, runMsg);
+  log.info('intake', 'queued', { scope: runScope, queueSize: size, debounceMs: DEBOUNCE_MS });
+}
+
+/**
+ * A message opening with `/new-topic` or a rung prefix, outside any topic: open a topic under
+ * it and hand back the message as it runs there. Undefined when the message
+ * stays where it is — no prefix, the feature is off, or Feishu would not open
+ * the topic.
+ */
+async function routeTopicPrefix(
+  channel: LarkChannel,
+  controls: Controls,
+  msg: NormalizedMessage,
+  scope: string,
+): Promise<{ msg: NormalizedMessage; scope: string } | undefined> {
+  if (msg.threadId) return undefined;
+  const prefs = controls.profileConfig.preferences;
+  if (prefs.topicPrefix === false) return undefined;
+  const ladder = resolveAutoEffort(prefs.autoEffort, controls.profileConfig.agentKind)?.ladder ?? [];
+  const prefix = matchTopicPrefix(
+    msg.content ?? '',
+    ladder.map((r) => r.label),
+    { attachments: msg.resources.length, quoted: Boolean(msg.replyToMessageId) },
+  );
+  if (!prefix) return undefined;
+  return openTopicFor(channel, msg, scope, prefix);
+}
+
+/** Open a topic under `msg` and hand back the message as it runs there; undefined when Feishu gives no topic back. */
+async function openTopicFor(
+  channel: LarkChannel,
+  msg: NormalizedMessage,
+  scope: string,
+  prefix: TopicPrefix,
+): Promise<{ msg: NormalizedMessage; scope: string } | undefined> {
+  const title = channel.botIdentity?.name ?? 'Occam';
+  const fallbackText = topicOpenedText(prefix);
+  const opened = await openTopicUnder(channel, msg, {
+    card: renderTopicOpenerCard(title, detectLocale([msg.content ?? ''])),
+  });
+  if (!opened) return undefined;
+  const { threadId, openerId } = opened;
+  const topicScope = threadId ? `${msg.chatId}:${threadId}` : undefined;
+  // The opener card is the topic's progress card to be; until a run takes it, it is held for the topic.
+  holdTopicOpener(topicScope ?? `opener:${openerId}`, { messageId: openerId, title, fallbackText });
+  if (!threadId || !topicScope) {
+    await releaseTopicOpener(channel, `opener:${openerId}`);
+    return undefined;
+  }
+  const moved = markSpawnedTopic({ ...msg, threadId, content: topicRunText(msg.content ?? '', prefix) });
+  if (isEdited(msg)) markEdited(moved);
+  log.info('topic-prefix', 'opened', { from: scope, scope: topicScope, msgId: msg.messageId, label: prefix.label });
+  return { msg: moved, scope: topicScope };
+}
+
+/**
+ * An edited message: swapped for its new content while it is still queued,
+ * folded into the run it started while that run is going, and otherwise taken
+ * in like a new message — which is how an @ added in the edit reaches the bot,
+ * and how an edit to a message already answered comes back as an update.
+ */
+async function intakeEdit(
+  deps: Omit<IntakeDeps, 'msg'> & { evt: EditEvent; edits: EditedMessages },
+): Promise<void> {
+  const { evt, edits, ...intake } = deps;
+  const { channel, activeRuns, pending, media, controls, recalled } = intake;
+  // Bots edit their own replies all the time; only people's edits count.
+  if (evt.senderType !== 'user') return;
+  if (!evt.event) {
+    log.warn('edit', 'no-sender', { chatId: evt.chatId, msgId: evt.messageId });
+    return;
+  }
+  if (!edits.firstSeen(evt)) {
+    log.info('edit', 'duplicate', { msgId: evt.messageId, updateTime: evt.updateTime });
+    return;
+  }
+  const botIdentity = channel.botIdentity;
+  if (!botIdentity || recalled?.has(evt.messageId)) return;
+  const msg = markEdited(
+    await normalize(evt.event, { botIdentity, stripBotMentions: true, includeRaw: true }),
+  );
+  log.info('edit', 'received', {
+    chatId: msg.chatId,
+    msgId: msg.messageId,
+    updateTime: evt.updateTime,
+    mentionedBot: msg.mentionedBot,
+  });
+
+  const queuedIn = pending.replace(msg.messageId, msg);
+  if (queuedIn) {
+    log.info('edit', 'requeued', { scope: queuedIn, msgId: msg.messageId });
+    return;
+  }
+
+  const running = runForMessage(activeRuns, msg.messageId);
+  const inject = running?.handle.run.inject?.bind(running.handle.run);
+  if (running && inject) {
+    const { scope, handle } = running;
+    const attachments = await media.resolve(
+      msg.resources.map((r) => ({ messageId: msg.messageId, resource: r })),
+      controls.profileConfig.attachments,
+    );
+    const prompt = buildPrompt(
+      [msg],
+      attachments,
+      [],
+      undefined,
+      botIdentity,
+      [editSupplementInstruction(msg.messageId)],
+      undefined,
+      isOwnerBatch(controls, [msg], (m) => senderTypeOf(m) === 'bot'),
+    );
+    // The run may have wrapped up (or the message been recalled) meanwhile.
+    const injected =
+      !recalled?.has(msg.messageId) &&
+      activeRuns.get(scope) === handle &&
+      inject(prompt, editPreview(msg.content));
+    if (injected) {
+      log.info('edit', 'injected', { scope, msgId: msg.messageId });
+      void addSupplementReaction(channel, msg.messageId);
+      return;
+    }
+    log.info('edit', 'fallback-queue', { scope, msgId: msg.messageId });
+  }
+
+  await intakeMessage({ ...intake, msg });
 }
 
 /**
  * Fold a follow-up into the run already going on this scope instead of
  * queueing it as a new question — only on an explicit signal (quote-reply to
  * the run, a 补充/追加/+ prefix, or posting in the same topic) and only from
- * the run's initiator or the owner. Everything else, including a run that can no longer take input,
- * keeps the queue-for-next-run behavior.
+ * any human — the initiator and the owner add with the run's identity, anyone
+ * else's supplement is marked as theirs and may not borrow it (see
+ * supplementRole). Bots, and a run that can no longer take input, keep the
+ * queue-for-next-run behavior.
  */
 async function tryInjectSupplement(deps: {
   channel: LarkChannel;
@@ -1385,10 +1651,17 @@ async function tryInjectSupplement(deps: {
     inTopic,
   );
   if (!signal) return false;
-  if (!maySupplement(target, msg.senderId, isCreator(controls, msg.senderId))) {
-    log.info('supplement', 'skip-not-initiator', { scope, sender: msg.senderId.slice(-6) });
+  const role = supplementRole(
+    target,
+    msg.senderId,
+    isCreator(controls, msg.senderId),
+    senderTypeOf(msg) === 'user',
+  );
+  if (!role) {
+    log.info('supplement', 'skip-not-human', { scope, sender: msg.senderId.slice(-6) });
     return false;
   }
+  const fromOther = role === 'other';
   const attachments = await media.resolve(
     msg.resources.map((r) => ({ messageId: msg.messageId, resource: r })),
     controls.profileConfig.attachments,
@@ -1399,7 +1672,9 @@ async function tryInjectSupplement(deps: {
     [],
     undefined,
     channel.botIdentity,
-    [SUPPLEMENT_INSTRUCTION],
+    fromOther
+      ? [SUPPLEMENT_INSTRUCTION, otherSupplementInstruction(msg.senderName)]
+      : [SUPPLEMENT_INSTRUCTION],
     undefined,
     isOwnerBatch(controls, [msg], (m) => senderTypeOf(m) === 'bot'),
   );
@@ -1408,7 +1683,14 @@ async function tryInjectSupplement(deps: {
   const injected =
     !deps.recalled?.has(msg.messageId) &&
     activeRuns.get(scope) === handle &&
-    handle.run.inject(prompt, supplementPreview(msg.content, attachments.length));
+    handle.run.inject(
+      prompt,
+      supplementPreview(
+        msg.content,
+        attachments.length,
+        fromOther ? (msg.senderName ?? '其他成员') : undefined,
+      ),
+    );
   if (!injected) {
     log.info('supplement', 'fallback-queue', { scope, msgId: msg.messageId, signal });
     return false;
@@ -1419,6 +1701,7 @@ async function tryInjectSupplement(deps: {
     scope,
     msgId: msg.messageId,
     signal,
+    role,
     attachments: attachments.length,
   });
   void addSupplementReaction(channel, msg.messageId);
@@ -1440,6 +1723,7 @@ interface RunBatchDeps {
   activePolicyFingerprints: Map<string, string>;
   lastRunModelByScope: Map<string, string>;
   pendingRotations: PendingRotationStore;
+  backgroundOrigins: BackgroundOrigins;
   contextCursors: ChatContextCursorStore;
   scope: string;
   mode: ChatMode;
@@ -1450,6 +1734,10 @@ interface RunBatchDeps {
   botOverload?: BotOverloadGuard;
   activeRuns?: ActiveRuns;
   recalled?: RecalledMessages;
+  /** 自动分级 state; unset: runs keep the profile's model and effort. */
+  autoEfforts?: AutoEffortStore;
+  /** For the rating call's scratch directory and account. */
+  profileDir?: string;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -1467,6 +1755,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints,
     lastRunModelByScope,
     pendingRotations,
+    backgroundOrigins,
     contextCursors,
     scope,
     mode,
@@ -1560,6 +1849,39 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
+  // 自动分级: rate the message while the rest of the run is prepared; the
+  // rung is settled once startRunFlow knows which conversation it resumes.
+  const autoEffortSettings = deps.autoEfforts
+    ? resolveAutoEffort(controls.profileConfig.preferences.autoEffort, controls.profileConfig.agentKind)
+    : undefined;
+  const chatEffortCap = effortPrefForChat(controls.profileConfig.preferences, chatId);
+  const autoEffortPlan: AutoEffortPlan | undefined =
+    autoEffortSettings && deps.autoEfforts
+      ? startAutoEffort({
+          settings: autoEffortSettings,
+          store: deps.autoEfforts,
+          scope,
+          texts: batch.map((m) => m.content ?? ''),
+          attachments: attachments.length,
+          ...(quotes[0] ? { quoted: quotes[0].content } : {}),
+          chatType: mode === 'p2p' ? 'p2p' : 'group',
+          owner: isOwnerBatch(controls, batch, (m) => senderTypeOf(m) === 'bot'),
+          ...(chatEffortCap ? { cap: chatEffortCap } : {}),
+          classify: {
+            cwd: join(deps.profileDir ?? tmpdir(), 'auto-effort-scratch'),
+            // The account a run would get now: the rating bills the same one.
+            env: () => (deps.profileDir ? (claudeAccountPool(deps.profileDir).pick()?.env ?? {}) : {}),
+          },
+          windowUsed: (kind) => {
+            if (!deps.profileDir) return undefined;
+            const pool = claudeAccountPool(deps.profileDir);
+            const id = pool.pick()?.id;
+            return id ? pool.windowUsed(id, kind) : undefined;
+          },
+        })
+      : undefined;
+  let autoPicked: AutoEffortPick | undefined;
+
   // 群聊 / 话题上下文: Feishu only delivers the group messages that @ the bot,
   // so read back what was said around them — see chat-context.ts for which
   // slice each situation gets.
@@ -1572,6 +1894,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     cursorMs: contextCursors.get(scope),
     hasSession: Boolean(sessions.getRaw(scope)?.sessionId),
     untilMs: contextUntilMs,
+    spawned: batch.some(isSpawnedTopic),
   });
   let chatContext: BridgePromptChatContext | undefined;
   if (contextPlan) {
@@ -1582,7 +1905,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     });
     if (fetched.messages.length > 0) {
       chatContext = {
-        scope: contextPlan.container === 'thread' ? 'topic' : 'group',
+        scope: contextPlan.container === 'thread' ? 'topic' : firstMsg.chatType === 'p2p' ? 'p2p' : 'group',
         window: contextPlan.window,
         ...(fetched.truncated ? { truncated: true } : {}),
         messages: fetched.messages.map(toPromptContextMessage),
@@ -1614,8 +1937,24 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const contextWarning = getContextWarning(controls.cfg);
   // A restricted chat fences every run there, the owner's included.
   const restrictedChat = controls.profileConfig.access.restrictedChats?.[chatId];
+  const editedIds = batch.filter(isEdited).map((m) => m.messageId);
+  // This batch goes to a process still running background tasks for earlier
+  // messages (RunExecutor reuses it): their reports may land in this turn.
+  // Without such a process their entries are stale — that work is gone.
+  let waitingOrigins: BackgroundOrigin[] = [];
+  if (executor.hasLiveProcess(scope)) {
+    waitingOrigins = backgroundOrigins.list(scope, new Set(batch.map((m) => m.messageId)));
+  } else if (backgroundOrigins.take(scope).length > 0) {
+    log.info('run', 'background-origins-dropped', { scope });
+  }
   const instructions = [
     ...(restrictedChat ? [restrictedChatInstruction(restrictedChat)] : []),
+    ...(autoEffortPlan?.forcedLabel
+      ? [
+          `消息开头的「/${autoEffortPlan.forcedLabel}」是给 bridge 的档位指令，本轮已按这个档位运行；` +
+            '它不是请求内容，忽略它，按其余文字处理。',
+        ]
+      : []),
     ...(modelSwitched
       ? [
           `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref)}」。` +
@@ -1623,16 +1962,23 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         ]
       : []),
     ...(smartSession ? [SMART_SESSION_INSTRUCTION] : []),
+    ...(editedIds.length > 0 ? [editInstruction(editedIds)] : []),
+    ...(waitingOrigins.length > 0
+      ? [backgroundTasksInstruction(waitingOrigins, executor.backgroundTasks(scope))]
+      : []),
   ];
   const extraInstructions = instructions.length > 0 ? instructions : undefined;
 
   // Memory and the skill index are read fresh on every run: `/memory add` in
   // the middle of a conversation has to take effect on the next message, not
   // the next restart.
+  // Only the owner's own private chat is shown the owner-only knowledge layer.
+  const ownerPrivate = firstMsg.chatType === 'p2p' && isOwnerBatch(controls, batch, (m) => senderTypeOf(m) === 'bot');
   const knowledgeContext = knowledge
     ? await buildKnowledgeContext({
         store: knowledge,
         scopeId: scope,
+        ownerPrivate,
         // Claude Code already lists its own skills: don't list them twice.
         ...nativeSkillOption(agentKind),
       }).catch((err: unknown) => {
@@ -1651,7 +1997,23 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         version: knowledgeContext.version,
         full: promptSection('bridge_knowledge', knowledgeContext),
         stub: promptSection('bridge_knowledge', knowledgeStub(knowledgeContext.version, knowledgeSnapshot)),
+        // The notes listed were put in front of the agent: the next days' index shows others first.
+        ...(knowledge && knowledgeContext.notes?.length
+          ? { onFull: () => knowledge.recordNoteExposure(listedNoteNames(knowledgeContext)) }
+          : {}),
       }
+    : undefined;
+  // Notes matching what is asked now: a section of its own, so the index above keeps its version.
+  const relevantNotes = knowledge
+    ? await findRelevantNotes({
+        store: knowledge,
+        scopeId: scope,
+        ownerPrivate,
+        query: batch.map((m) => m.content).join('\n'),
+      }).catch((err: unknown) => {
+        log.warn('knowledge', 'relevance-failed', { scope, err: String(err) });
+        return undefined;
+      })
     : undefined;
 
   // Changes to the bridge and the agent itself are the owner's alone: other
@@ -1666,6 +2028,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     extraInstructions,
     knowledgeContext,
     ownerRun,
+    relevantNotes,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -1787,6 +2150,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     ...(firstMsg.senderName ? { actorName: firstMsg.senderName } : {}),
     ...(knowledgeDedupe ? { knowledge: knowledgeDedupe } : {}),
     ...(gate ? { gate } : {}),
+    ...(autoEffortPlan
+      ? {
+          pickLevel: async (resumeFrom: string | undefined) => {
+            autoPicked = await autoEffortPlan.pick(resumeFrom, executor.hasLiveProcess(scope));
+            return autoPicked ? { model: autoPicked.model, effort: autoPicked.effort } : undefined;
+          },
+        }
+      : {}),
     onBackgroundTurn: (turn) => deliverBackgroundTurn?.(turn) ?? Promise.resolve(),
     observability: {
       profile: controls.profile,
@@ -1892,13 +2263,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     // an id this claude build/account doesn't recognize).
     if (evt.type === 'system' && evt.model) {
       log.info('session', 'model', {
-        requested: requestedModel ?? 'default',
+        requested: autoPicked?.model ?? requestedModel ?? 'default',
         actual: evt.model,
       });
       // Same ground truth for the reader: the byline shows the concrete model
       // (e.g. Opus 5.5) instead of only the "always latest" alias picked in /config.
       if (cardRenderOptions.meta) {
-        cardRenderOptions.meta.model = resolvedModelLabel(agentKind, modelPref, evt.model);
+        cardRenderOptions.meta.model = resolvedModelLabel(agentKind, autoPicked?.model ?? modelPref, evt.model);
       }
     }
     if (evt.type === 'system' && evt.threadId) {
@@ -1965,8 +2336,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     meta: {
       title: channel.botIdentity?.name ?? controls.profile,
       agent: capability.agentId,
-      model: modelLabel(agentKind, modelPref),
-      effort: resolveEffortArg(agentKind, effortPrefForChat(controls.profileConfig.preferences, chatId)),
+      model: modelLabel(agentKind, autoPicked?.model ?? modelPref),
+      effort: autoPicked
+        ? autoEffortByline(autoPicked)
+        : resolveEffortArg(agentKind, effortPrefForChat(controls.profileConfig.preferences, chatId)),
       provider: capability.descriptor.provider,
       ...(flow.rotated ? { notice: rotationNotice(flow.rotated) } : {}),
     },
@@ -1994,25 +2367,65 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (cardRenderOptions.meta) cardRenderOptions.meta.sponsor = sponsor;
   });
 
+  // This run's message, as a place results can be pointed to.
+  const here: ResultLocation = {
+    messageId: lastMsg.messageId,
+    preview: messagePreview(mediaPlaceholders(lastMsg.content ?? '')),
+    sentAt: lastMsg.createTime || runSubmittedAt,
+  };
+  // Close out the messages waiting on this process's background work, now
+  // that it is over (see BackgroundOrigins).
+  const settleWaiting = (outcome: 'done' | 'stopped'): Promise<void> => {
+    const origins = backgroundOrigins.take(scope);
+    if (origins.length === 0) return Promise.resolve();
+    return settleBackgroundOrigins({
+      channel,
+      scope,
+      origins,
+      outcome,
+      where: here,
+      longRunNoticeMs: getLongRunNoticeMs(controls.cfg),
+    });
+  };
+  // A background turn already reported the work over (it can beat this run's
+  // own wrap-up below).
+  let backgroundSettled = false;
   // Turns the agent runs on its own after this reply (a background task it
   // started reported back) go out as a follow-up reply to the same message.
   deliverBackgroundTurn = async (turn) => {
     const state = backgroundTurnState(turn, filterForPrefs);
-    if (!state) return;
-    // The follow-up's byline reports the background turn's own consumption.
-    const usage = turn.kind === 'turn' ? usageLineOf(turn.events) : undefined;
-    const turnContextWarning = turn.kind === 'turn' ? contextWarningOf(turn.events, contextWarning, scope) : undefined;
-    await sendFinalReply({
-      channel,
-      chatId,
-      scope,
-      state: separateFinalReply ? finalAnswerOnlyState(state) : state,
-      replyMode,
-      sendOpts,
-      cardRenderOptions: cardRenderOptions.meta
-        ? { ...cardRenderOptions, meta: { ...cardRenderOptions.meta, usage, contextWarning: turnContextWarning } }
-        : cardRenderOptions,
-    });
+    if (state) {
+      // The follow-up's byline reports the background turn's own consumption.
+      const usage = turn.kind === 'turn' ? usageLineOf(turn.events) : undefined;
+      const turnContextWarning = turn.kind === 'turn' ? contextWarningOf(turn.events, contextWarning, scope) : undefined;
+      // Nor does it repeat the run's 「本轮从新会话开始」: that was about the run.
+      const { notice: _runNotice, ...meta } = cardRenderOptions.meta ?? { title: '' };
+      await sendFinalReply({
+        channel,
+        chatId,
+        scope,
+        state: separateFinalReply ? finalAnswerOnlyState(state) : state,
+        replyMode,
+        sendOpts,
+        cardRenderOptions: cardRenderOptions.meta
+          ? { ...cardRenderOptions, meta: { ...meta, usage, contextWarning: turnContextWarning } }
+          : cardRenderOptions,
+      });
+    }
+    // 会话智能压缩: the turn that ends the background work may close the
+    // conversation — the run's own answer could not while work was pending.
+    if (smartSession && turn.kind === 'turn' && turn.background === 0) {
+      const request = newSessionRequest(answerTextOf(finalizeIfRunning(turn.events.reduce(reduce, initialState))));
+      if (request) {
+        pendingRotations.set(scope, { ...request, ...(conversationHandle ? { handle: conversationHandle } : {}) });
+        log.info('session', 'rotation-requested', { scope, hasSummary: Boolean(request.summary), via: 'background-turn' });
+      }
+    }
+    if (turn.kind === 'turn' && turn.background > 0) return;
+    // The work is over: this message's follow-up holds the result; any other
+    // message still waiting on it is pointed here.
+    backgroundSettled = true;
+    await settleWaiting(turn.kind === 'stopped' ? 'stopped' : 'done');
   };
 
   // Add a "Typing" reaction to the triggering message as an instant ack that
@@ -2035,6 +2448,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // Whether the answer went out as a message of its own (which pushes), as
   // opposed to landing in the progress card that was created at the start.
   let answerIsNewMessage = false;
+
+  // Only the progress card can take over a topic's opener card; any other reply leaves it the notice it stands for.
+  if (cotEnabled || replyMode !== 'card') await releaseTopicOpener(channel, scope);
 
   try {
     if (cotEnabled) {
@@ -2123,27 +2539,30 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         lastLiveCard = fitted.card;
         return fitted.card;
       };
-      const progress = createLazyProgressStream(scope, replyMode, () =>
-        channel.stream(
-          chatId,
-          {
-            card: {
-              initial: renderCard(initialState, cardRenderOptions),
-              producer: async (ctrl) => {
-                producerStarted = true;
-                if (progress.abandoned()) return;
-                cardCtrl = ctrl;
-                cardMessageId = ctrl.messageId;
-                instrumentCardPatches(ctrl, cardHealth);
-                supplementTarget.replyIds.add(ctrl.messageId);
-                await ctrl.update(renderLiveCard(latestState));
-                await renderDone;
-              },
-            },
-          },
-          sendOpts,
-        ),
-      );
+      const cardProducer = async (ctrl: NonNullable<typeof cardCtrl> & { readonly messageId: string }): Promise<void> => {
+        producerStarted = true;
+        if (progress.abandoned()) return;
+        cardCtrl = ctrl;
+        cardMessageId = ctrl.messageId;
+        instrumentCardPatches(ctrl, cardHealth);
+        supplementTarget.replyIds.add(ctrl.messageId);
+        await ctrl.update(renderLiveCard(latestState));
+        await renderDone;
+      };
+      const progress = createLazyProgressStream(scope, replyMode, () => {
+        const initial = renderCard(initialState, cardRenderOptions);
+        // A topic opened for this message: its first post is already this card, waiting to be taken over.
+        const opener = takeTopicOpener(scope);
+        if (opener) {
+          log.info('topic-prefix', 'opener-adopted', { scope, msgId: opener.messageId });
+          // Left empty, it goes back to the notice rather than being recalled: it opened the topic.
+          return adoptCardStream(channel, opener.messageId, initial, cardProducer).then((r) => ({
+            ...r,
+            emptyCard: topicOpenedNoticeCard(opener),
+          }));
+        }
+        return channel.stream(chatId, { card: { initial, producer: cardProducer } }, sendOpts);
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -2390,8 +2809,35 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   } finally {
     runs?.finish(execution.runId);
     activePolicyFingerprints.delete(scope);
+    autoEffortPlan?.finish({
+      ...(conversationHandle ? { handle: conversationHandle } : {}),
+      ...(runTerminal ? { terminal: runTerminal } : {}),
+      durationMs: Date.now() - runSubmittedAt,
+    });
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
-    if (runTerminal === 'done') void addDoneReaction(channel, lastMsg.messageId);
+    // Answered, but background tasks the agent started still run: the task
+    // isn't over, so 「完成」 (reaction, long-run notice) waits for the
+    // background turn that ends them — see deliverBackgroundTurn.
+    const background = backgroundSettled ? 0 : backgroundLeft(lastRawState);
+    if (runTerminal === 'done' && background > 0) {
+      backgroundOrigins.add(scope, {
+        messageId: lastMsg.messageId,
+        chatId,
+        replyInThread: Boolean(sendOpts.replyInThread),
+        preview: here.preview,
+        sentAt: here.sentAt,
+        submittedAt: runSubmittedAt,
+        p2p: mode === 'p2p',
+        requesters: humanRequesters(batch),
+      });
+      log.info('run', 'done-deferred', { scope, background });
+    } else if (runTerminal === 'done' && waitingOrigins.length > 0) {
+      // This turn ran in the process earlier messages' background work lived
+      // in, and that work is over now — its reports were folded into this
+      // turn (or it was stopped here): point those messages at this reply.
+      void settleWaiting('done');
+    }
+    if (runTerminal === 'done' && background === 0) void addDoneReaction(channel, lastMsg.messageId);
     if (autoResumer) {
       if (runTerminal === 'paused' && runLimit && canAutoResume) {
         void autoResumer.schedule({
@@ -2452,7 +2898,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         }
       }
     }
-    const longRunNotice = planLongRunNotice({
+    const longRunNotice = runTerminal === 'done' && background > 0 ? undefined : planLongRunNotice({
       thresholdMs: getLongRunNoticeMs(controls.cfg),
       elapsedMs: Date.now() - runSubmittedAt,
       terminal: runTerminal,
@@ -2463,7 +2909,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (longRunNotice) void sendLongRunNotice(channel, chatId, longRunNotice, sendOpts, scope);
     if (smartSession && runTerminal === 'done') {
       const request = newSessionRequest(answerTextOf(lastRawState));
-      if (request) {
+      if (request && background > 0) {
+        // Work still running isn't a finished task: closing the conversation
+        // now would cut it off from its own results.
+        log.info('session', 'rotation-request-ignored', { scope, background });
+      } else if (request) {
         pendingRotations.set(scope, { ...request, ...(conversationHandle ? { handle: conversationHandle } : {}) });
         log.info('session', 'rotation-requested', { scope, hasSummary: Boolean(request.summary) });
       }
@@ -2786,7 +3236,8 @@ async function recallIfEmptyStreamedReply(
     );
     return;
   }
-  if (renderText(finalState).trim() !== '') return;
+  // The 「后台任务还在跑」 note alone is no answer.
+  if (renderText({ ...finalState, background: 0 }).trim() !== '') return;
   const result = await progress.settled.catch(() => undefined);
   await recallStreamedMessage(channel, result, scope);
 }
@@ -2796,9 +3247,14 @@ async function recallStreamedMessage(
   streamResult: unknown,
   scope: string,
 ): Promise<void> {
-  const messageId = (streamResult as { messageId?: string } | undefined)?.messageId;
+  const { messageId, emptyCard } = (streamResult ?? {}) as { messageId?: string; emptyCard?: object };
   if (!messageId) return;
   try {
+    if (emptyCard) {
+      await channel.updateCard(messageId, emptyCard);
+      log.info('outbound', 'empty-opener-restored', { scope, messageId });
+      return;
+    }
     await channel.recallMessage(messageId);
     log.info('outbound', 'recall-empty', { scope, messageId });
   } catch (err) {
@@ -3134,6 +3590,7 @@ function buildPrompt(
   extraInstructions?: string[],
   knowledge?: BridgePromptKnowledge,
   senderIsOwner = false,
+  relevantNotes?: RelevantNotes,
 ): string {
   const first = batch[0];
   if (!first) return '';
@@ -3180,6 +3637,7 @@ function buildPrompt(
         : BRIDGE_AGENT_INSTRUCTIONS,
     userInput: userPart,
     ...(knowledge ? { knowledge } : {}),
+    ...(relevantNotes ? { relevantNotes } : {}),
     ...(chatContext ? { chatContext } : {}),
     quotedMessages: quotes.map(toPromptQuote),
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
@@ -3332,7 +3790,9 @@ export function backgroundTurnState(
     const notice =
       turn.reason === 'shutdown'
         ? 'bridge 重启，还在运行的后台任务已停止。会话上下文没丢，需要的话回一句「继续」重新发起。'
-        : `后台任务运行超过 ${Math.round(turn.afterMs / 60_000)} 分钟仍未结束，已停止。需要的话请重新发起。`;
+        : turn.reason === 'replaced'
+          ? '下一条消息要换一个进程处理（模型、档位或附件不同），还在运行的后台任务已停止。会话上下文没丢，需要的话回一句「继续」重新发起。'
+          : `后台任务运行超过 ${Math.round(turn.afterMs / 60_000)} 分钟仍未结束，已停止。需要的话请重新发起。`;
     const start = turn.account ? reduce(initialState, { type: 'account', label: turn.account }) : initialState;
     return reduce(reduce(start, { type: 'text', delta: notice }), {
       type: 'done',
@@ -3340,12 +3800,13 @@ export function backgroundTurnState(
     });
   }
   const own = finalizeIfRunning(turn.events.reduce(reduce, initialState));
-  if (!renderText(filterForPrefs(own)).trim()) return undefined;
+  // A turn that only says background work goes on (a heartbeat) has nothing to tell.
+  if (!renderText(filterForPrefs({ ...own, background: 0 })).trim()) return undefined;
   const withPrefix = turn.events.reduce(
     reduce,
     reduce(initialState, { type: 'text', delta: BACKGROUND_TURN_PREFIX }),
   );
-  return filterForPrefs(finalizeIfRunning(withPrefix));
+  return filterForPrefs({ ...finalizeIfRunning(withPrefix), background: turn.background });
 }
 
 /** Queued messages older than this at boot are reported instead of processed. */

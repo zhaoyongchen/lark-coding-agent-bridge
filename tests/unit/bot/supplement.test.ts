@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { SupplementTarget } from '../../../src/bot/active-runs';
 import {
-  maySupplement,
+  otherSupplementInstruction,
   supplementPreview,
+  supplementRole,
   supplementSignal,
 } from '../../../src/bot/supplement';
 import { initialState, reduce } from '../../../src/card/run-state';
@@ -53,11 +54,28 @@ describe('supplementSignal', () => {
   });
 });
 
-describe('maySupplement', () => {
-  it('allows the run initiator and the owner only', () => {
-    expect(maySupplement(target(), 'ou_starter', false)).toBe(true);
-    expect(maySupplement(target(), 'ou_owner', true)).toBe(true);
-    expect(maySupplement(target(), 'ou_someone_else', false)).toBe(false);
+describe('supplementRole', () => {
+  it('lets the owner and the initiator add with the run identity', () => {
+    expect(supplementRole(target(), 'ou_owner', true, true)).toBe('owner');
+    expect(supplementRole(target(), 'ou_starter', false, true)).toBe('initiator');
+    // The owner wins even if the sender type is unknown (e.g. raw event missing).
+    expect(supplementRole(target(), 'ou_owner', true, false)).toBe('owner');
+    expect(supplementRole(target(), 'ou_starter', false, false)).toBe('initiator');
+  });
+
+  it('lets other humans add as "other" and still refuses bots', () => {
+    expect(supplementRole(target(), 'ou_someone_else', false, true)).toBe('other');
+    expect(supplementRole(target(), 'ou_other_bot', false, false)).toBeUndefined();
+  });
+});
+
+describe('otherSupplementInstruction', () => {
+  it('names the sender and forbids borrowing the run permissions', () => {
+    const text = otherSupplementInstruction('李爽');
+    expect(text).toContain('「李爽」');
+    expect(text).toContain('不是 bot 主人');
+    expect(text).toContain('不能借用当前任务的权限');
+    expect(otherSupplementInstruction()).toContain('另一位成员');
   });
 });
 
@@ -68,6 +86,11 @@ describe('supplementPreview', () => {
     expect(supplementPreview('/补充 是主机全局记忆', 0)).toBe('是主机全局记忆');
     expect(supplementPreview('这个也看下', 0)).toBe('这个也看下');
     expect(supplementPreview('补'.repeat(80), 0)).toBe(`${'补'.repeat(60)}…`);
+  });
+
+  it('prefixes the sender when the supplement is not from the initiator', () => {
+    expect(supplementPreview('+ nacos没有配置', 0, '李爽')).toBe('（李爽）nacos没有配置');
+    expect(supplementPreview('', 1, '李爽')).toBe('（李爽）（1 个附件）');
   });
 
   it('shows images and files as numbered placeholders instead of raw keys', () => {

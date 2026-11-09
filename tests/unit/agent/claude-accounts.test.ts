@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   BACKGROUND_FAILOVER_PROMPT,
   failoverPrompt,
@@ -17,7 +17,9 @@ import {
   accountSecretId,
   bestSwitchTarget,
   findAccountRow,
+  findPausedAccount,
   formatAge,
+  pausedNote,
   formatDaysHours,
   formatHoursMinutes,
   parseSwitchQuery,
@@ -25,7 +27,9 @@ import {
   switchRefusal,
   STICKY_MARGIN,
   switchScore,
+  expiringFirstNote,
   switchToAccount,
+  GRACE_LINE,
   reorderAccounts,
   updateDefaultLines,
   claudeAccountsPaths,
@@ -39,10 +43,10 @@ import {
   type AccountRow,
 } from '../../../src/agent/claude/accounts.js';
 import { readClaudeQuota } from '../../../src/agent/claude/quota.js';
-import { refreshPickQuota } from '../../../src/agent/claude/quota-probe.js';
+import { refreshAllQuota, refreshPickQuota } from '../../../src/agent/claude/quota-probe.js';
 import { translateEvent } from '../../../src/agent/claude/stream-json.js';
 import type { AgentEvent, AgentRun, AgentRunOptions } from '../../../src/agent/types.js';
-import { readVerification } from '../../../src/cli/commands/claude-account.js';
+import { parsePauseUntil, readVerification } from '../../../src/cli/commands/claude-account.js';
 import { renderCard } from '../../../src/card/run-renderer.js';
 import { initialState, reduce } from '../../../src/card/run-state.js';
 import { getSecret } from '../../../src/config/keystore.js';
@@ -155,7 +159,7 @@ describe('ClaudeAccountPool', () => {
     const { pool } = await poolWith(['b'], { switchAtPercent: 90 });
     pool.observe('default', limit({ windows: [{ kind: 'seven_day_opus', usedPercent: 100, resetsAt: NOW + HOUR }] }));
     expect(pool.pick()?.id).toBe('default');
-    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 91, resetsAt: NOW + HOUR }] }));
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 91, resetsAt: NOW + 3 * 24 * HOUR }] }));
     expect(pool.pick()?.id).toBe('b');
   });
 
@@ -218,12 +222,12 @@ describe('account table and switching (/accounts)', () => {
     expect(formatDaysHours(5 * HOUR)).toBe('0d5h');
   });
 
-  it('scores weekly room, weekly room about to reset, and 5-hour room; an account that never ran counts half full', () => {
+  it('scores the weekly reset first, then weekly room and 5-hour room; an account that never ran counts half full', () => {
     const view = (five: number, week: number, weekResetIn?: number) => ({
       five_hour: { usedPercent: five, line: 80 },
       seven_day: { usedPercent: week, line: 90, ...(weekResetIn !== undefined ? { resetsInMs: weekResetIn } : {}) },
     });
-    // 0.30 × 0.8 + 0.45 × 0.8 × 0.5 + 0.25 × 0.5
+    // 0.60 × 0.5 × 1 + 0.15 × 0.8 + 0.25 × 0.5
     expect(switchScore(view(40, 18, 3.5 * DAY), true)).toBeCloseTo(0.545);
     expect(switchScore(view(0, 10, 6 * DAY), true)).toBeGreaterThan(switchScore(view(0, 86, 6 * DAY), true));
     // Same usage: the week that resets sooner wins.
@@ -234,9 +238,28 @@ describe('account table and switching (/accounts)', () => {
     expect(switchScore(view(0, 90, HOUR), true)).toBe(0);
     expect(switchScore(view(80, 0, HOUR), true)).toBe(0);
     expect(switchScore(view(0, 89, HOUR), true)).toBeGreaterThan(0.25);
-    expect(switchScore(view(0, 0), false)).toBeCloseTo(0.275);
+    expect(switchScore(view(0, 0), false)).toBeCloseTo(0.2);
     // Weekly room about to be lost outweighs a little more room that keeps for days.
     expect(switchScore(view(0, 40, 12 * HOUR), true)).toBeGreaterThan(switchScore(view(0, 20, 6 * DAY), true));
+    // A few points left before the line are not worth a move for the near reset alone.
+    expect(switchScore(view(0, 88, 12 * HOUR), true)).toBeLessThan(switchScore(view(0, 70, 3 * DAY), true));
+  });
+
+  it('spends the week that resets first, however much room the later ones have (2026-11-03)', () => {
+    const view = (five: [number, number], week: [number, number], weekResetIn: number) => ({
+      five_hour: { usedPercent: five[0], line: five[1] },
+      seven_day: { usedPercent: week[0], line: week[1], resetsInMs: weekResetIn },
+    });
+    // /accounts that day: shilong.wang 6% of 98 resetting in 6d13h scored 54,
+    // 汤欢 51% of 90 resetting in 2d20h only 50 — her 39 points would be lost.
+    const shilong = switchScore(view([8, 98], [6, 98], 6 * DAY + 13 * HOUR), true);
+    const tanghuan = switchScore(view([0, 60], [51, 90], 2 * DAY + 20 * HOUR), true);
+    const yuou = switchScore(view([0, 80], [30, 90], 4 * DAY + 23 * HOUR), true);
+    expect(tanghuan).toBeGreaterThan(yuou);
+    expect(yuou).toBeGreaterThan(shilong);
+    expect(tanghuan - shilong).toBeGreaterThan(STICKY_MARGIN);
+    // Less room, but it runs out first: still first.
+    expect(switchScore(view([0, 98], [70, 90], 2 * DAY), true)).toBeGreaterThan(switchScore(view([0, 98], [0, 90], 6 * DAY), true));
   });
 
   it('lists every account in one table, one column per figure', async () => {
@@ -245,14 +268,38 @@ describe('account table and switching (/accounts)', () => {
       { kind: 'five_hour', usedPercent: 46, resetsAt: NOW + 4 * HOUR + 32 * MIN },
       { kind: 'seven_day', usedPercent: 55, resetsAt: NOW + 2 * DAY + 22 * HOUR },
     ] }));
-    pool.observe('b', limit({ windows: [{ kind: 'seven_day', usedPercent: 10, resetsAt: NOW + 5 * DAY }] }));
+    pool.observe('b', limit({ windows: [{ kind: 'seven_day', usedPercent: 10, resetsAt: NOW + DAY }] }));
     const rows = accountRows(pool, 'shilong.wang', NOW);
     const table = accountsTable(rows);
     expect(table.split('\n')[0]).toBe('| 账户 | 5 小时用量 / 重置 | 本周用量 / 重置 | 切换线（5 小时 / 本周） | 得分 | 状态 |');
-    expect(table).toContain('| **shilong.wang**（主，default） | 46% / 4h32m | 55% / 2d22h | 98% / 98% | 38 | 可用 |');
+    expect(table).toContain('| **shilong.wang**（主，default） | 46% / 4h32m | 55% / 2d22h | 98% / 98% | 55 | 可用 |');
     // The best score takes the next run, main account or not.
-    expect(table).toContain('| ✅ **b-name**（备 1，b） | — | 10% / 5d0h | 98% / 98% | 63 | 使用中 |');
-    expect(table).toContain('| **c-name**（备 2，c） | — | — | 98% / 98% | 28 | 还没运行过 |');
+    expect(table).toContain('| ✅ **b-name**（备 1，b） | — | 10% / 1d0h | 98% / 98% | 90 | 使用中 |');
+    expect(table).toContain('| **c-name**（备 2，c） | — | — | 98% / 98% | 20 | 还没运行过 |');
+    expect(expiringFirstNote(rows)).toBe('⏳ 先到期先用：**b-name** 本周 1d0h 后重置，离切换线还有 88 个百分点，新任务先用它。');
+  });
+
+  it('says when the week that runs out first does not take the next run', async () => {
+    const { pool } = await poolWith(['b']);
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 50, resetsAt: NOW + 3 * DAY }] }));
+    // An hour sooner, but not ahead by more than the margin: the main account keeps the run.
+    pool.observe('b', limit({ windows: [{ kind: 'seven_day', usedPercent: 40, resetsAt: NOW + 3 * DAY - HOUR }] }));
+    const rows = accountRows(pool, 'shilong.wang', NOW);
+    expect(rows.find((row) => row.next)?.id).toBe('default');
+    expect(expiringFirstNote(rows)).toBe(
+      '⏳ 先到期先用：**b-name** 本周 2d23h 后重置，离切换线还有 58 个百分点；得分领先不到 5 分，换号要整段对话重读一遍，不值得，新任务暂时还用 **shilong.wang**。',
+    );
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 50, resetsAt: NOW + 6 * DAY }] }));
+    // 6 points left, a day before its reset: still worth using first.
+    pool.observe('b', limit({ windows: [{ kind: 'seven_day', usedPercent: 92, resetsAt: NOW + 30 * HOUR }] }));
+    expect(expiringFirstNote(accountRows(pool, 'shilong.wang', NOW))).toBe(
+      '⏳ 先到期先用：**b-name** 本周 1d6h 后重置，离切换线还有 6 个百分点，新任务先用它。',
+    );
+    // 1 point left: not worth a move.
+    pool.observe('b', limit({ windows: [{ kind: 'seven_day', usedPercent: 97, resetsAt: NOW + 30 * HOUR }] }));
+    expect(expiringFirstNote(accountRows(pool, 'shilong.wang', NOW))).toBe(
+      '⏳ 先到期先用：**b-name** 本周 1d6h 后重置，离切换线还有 1 个百分点；只剩这点不值得专门换号，新任务暂时还用 **shilong.wang**。',
+    );
   });
 
   it('switches without a name to the best-scoring account with room, never the current one', async () => {
@@ -374,6 +421,31 @@ function fakeRun(events: AgentEvent[], log: string[] = []): AgentRun {
       log.push('stop');
     },
     waitForExit: async () => true,
+  };
+}
+
+/**
+ * A scripted claude attempt kept on for its background tasks: after its
+ * events it stays up, as the real process does, until it is stopped.
+ */
+function lingeringRun(events: AgentEvent[], log: string[] = []): AgentRun {
+  let release!: () => void;
+  const stopped = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    runId: 'r',
+    pid: 1,
+    events: (async function* () {
+      yield* events;
+      await stopped;
+      yield { type: 'done', terminationReason: 'interrupted' } as AgentEvent;
+    })(),
+    stop: async () => {
+      log.push('stop');
+      release();
+    },
+    waitForExit: async () => false,
   };
 }
 
@@ -613,6 +685,73 @@ describe('account failover', () => {
     expect(calls[1]!.opts.prompt).toBe(BACKGROUND_FAILOVER_PROMPT);
     expect(pool.isRefused('default')).toBe(true);
     expect(events).toContainEqual(expect.objectContaining({ type: 'account', switchedFrom: 'default' }));
+  });
+
+  it('moves a refused user turn with background subagents at once, not when the kept process ends', async () => {
+    const { pool } = await poolWith(['b']);
+    const calls: Array<{ account: string; opts: AgentRunOptions }> = [];
+    const stops: string[] = [];
+    const run = runWithAccountFailover(OPTS, {
+      pool,
+      spawn: (opts, account) => {
+        calls.push({ account: account.id, opts });
+        return calls.length === 1
+          ? lingeringRun(
+              [
+                { type: 'system', sessionId: 's1' },
+                { type: 'background', count: 4 },
+                { type: 'subagent_rate_limited', taskId: 'a1', at: NOW },
+                limit({ blocked: true, message: "You've hit your 5-hour limit" }),
+                { type: 'usage', costUsd: 11 },
+                { type: 'done', sessionId: 's1', terminationReason: 'normal' },
+              ],
+              stops,
+            )
+          : fakeRun([{ type: 'text', delta: 'resumed on b' }, { type: 'done', sessionId: 's1', terminationReason: 'normal' }]);
+      },
+      labelOf: async (account) => account.label ?? account.id,
+    });
+    const events = await collect(run);
+    expect(calls.map((c) => c.account)).toEqual(['default', 'b']);
+    expect(stops).toEqual(['stop']);
+    // The whole session — main agent and every subagent — goes to one account.
+    expect(calls[1]!.opts).toMatchObject({ sessionId: 's1', prompt: failoverPrompt('hello', { subagents: true }) });
+    expect(calls[1]!.opts.prompt).toContain('SendMessage');
+    expect(events.filter((e) => e.type === 'rate_limit')).toEqual([]);
+    expect(events.filter((e) => e.type === 'done')).toHaveLength(1);
+    expect(events.filter((e) => e.type === 'background')).toEqual([
+      { type: 'background', count: 4 },
+      { type: 'background', count: 0 },
+    ]);
+    expect(events).toContainEqual({ type: 'account', label: 'b-name', switchedFrom: 'default' });
+    expect(pool.pick()?.id).toBe('b');
+  });
+
+  it('with no account to move to, a refused user turn with background tasks pauses at once', async () => {
+    const { pool } = await poolWith(['b']);
+    pool.observe('b', limit({ blocked: true, resetsAt: NOW + 30 * 60_000 }));
+    const spawned: string[] = [];
+    const run = runWithAccountFailover(OPTS, {
+      pool,
+      spawn: (_opts, account) => {
+        spawned.push(account.id);
+        return lingeringRun([
+          { type: 'background', count: 2 },
+          limit({ blocked: true, resetsAt: NOW + HOUR }),
+          { type: 'done', sessionId: 's1', terminationReason: 'normal' },
+        ]);
+      },
+      labelOf: async () => 'me',
+    });
+    const seen: AgentEvent[] = [];
+    for await (const evt of run.events) {
+      seen.push(evt);
+      if (evt.type === 'done') break;
+    }
+    expect(spawned).toEqual(['default']);
+    expect(seen.reduce(reduce, initialState).terminal).toBe('paused');
+    expect(seen.find((e) => e.type === 'rate_limit')).toMatchObject({ blocked: true, resetsAt: NOW + 30 * 60_000 });
+    await run.stop();
   });
 
   it('a refused background turn of a stopped run stays put', async () => {
@@ -1035,6 +1174,121 @@ describe('switch lines and rounds', () => {
   });
 });
 
+describe('pausing an account', () => {
+  it('keeps a paused account out of every pick until the pause ends, then it comes back on its own', async () => {
+    let now = NOW;
+    const { pool, paths } = await poolWith(['b', 'c'], { now: () => now });
+    await updateAccount(paths, 'b', { pausedUntil: NOW + 14 * 24 * HOUR });
+    await pool.refresh();
+    expect(readAccountsConfig(paths).accounts[1]).toEqual({ id: 'b', label: 'b-name', pausedUntil: NOW + 14 * 24 * HOUR });
+    expect(pool.accounts().map((a) => a.id)).toEqual(['default', 'c']);
+    expect(pool.isPaused('b')).toBe(true);
+    pool.observe('default', limit({ blocked: true, resetsAt: NOW + HOUR }));
+    pool.observe('c', limit({ blocked: true, resetsAt: NOW + 2 * HOUR }));
+    // Every other account refused: still not the paused one.
+    expect(pool.pick()?.id).toBe('default');
+    expect(pool.pickRunnable()).toBeUndefined();
+    expect(findPausedAccount(pool, 'B-NAME')).toMatchObject({ id: 'b', name: 'b-name' });
+    expect(pausedNote(pool)).toContain('b-name（b）到');
+    expect(accountsReport(pool, 'yu.ou', NOW).at(-1)).toContain('**b-name**（已暂停，b；');
+    expect(accountRows(pool, 'yu.ou', NOW).map((r) => r.id)).toEqual(['default', 'c']);
+
+    now = NOW + 14 * 24 * HOUR + 1;
+    expect(pool.isPaused('b')).toBe(false);
+    expect(pool.accounts().map((a) => a.id)).toEqual(['default', 'b', 'c']);
+    expect(pausedNote(pool)).toBeUndefined();
+  });
+
+  it('resumes on request', async () => {
+    const { pool, paths } = await poolWith(['b']);
+    await updateAccount(paths, 'b', { pausedUntil: NOW + HOUR });
+    await updateAccount(paths, 'b', { pausedUntil: null });
+    await pool.refresh();
+    expect(readAccountsConfig(paths).accounts[1]).toEqual({ id: 'b', label: 'b-name' });
+    expect(pool.isPaused('b')).toBe(false);
+  });
+
+  it('pauses the CLI login too, but never the last account in rotation', async () => {
+    const { pool, paths } = await poolWith(['b']);
+    const later = Date.now() + 24 * HOUR;
+    await updateAccount(paths, 'default', { pausedUntil: later });
+    await pool.refresh();
+    expect(readAccountsConfig(paths).accounts[0]).toEqual({ id: 'default', pausedUntil: later });
+    expect(pool.accounts().map((a) => a.id)).toEqual(['b']);
+    expect(pool.pick()?.id).toBe('b');
+    // The lone backup still reads and reports as an account of its own, not the CLI login.
+    expect(pool.multi).toBe(true);
+    await expect(updateAccount(paths, 'b', { pausedUntil: later })).rejects.toThrow('至少要留一个没暂停的账户');
+    expect(parseAccountsConfig(JSON.stringify({ accounts: [{ id: 'default', pausedUntil: later }] })).accounts).toEqual([
+      { id: 'default', pausedUntil: later },
+    ]);
+  });
+
+  it('keeps the pause through a switch and a reorder', async () => {
+    const { paths } = await poolWith(['b', 'c']);
+    await updateAccount(paths, 'b', { pausedUntil: NOW + HOUR });
+    await switchToAccount(paths, 'c');
+    await reorderAccounts(paths, ['b']);
+    expect(readAccountsConfig(paths).accounts.find((a) => a.id === 'b')?.pausedUntil).toBe(NOW + HOUR);
+  });
+
+  it('hands the next message elsewhere once the kept process is on an account that got paused', async () => {
+    const { pool, paths } = await poolWith(['b']);
+    const sent: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const calls: string[] = [];
+    pool.promote('b');
+    await pool.flush();
+    // A capped run (课堂精练) does not follow the main account: only the pause moves it.
+    const run = runWithAccountFailover({ ...OPTS, accountLineCap: { five_hour: 80 } }, {
+      pool,
+      spawn: (_opts, account) => {
+        calls.push(account.id);
+        if (calls.length > 1) return fakeRun([{ type: 'done', sessionId: 's1', terminationReason: 'normal' }]);
+        return {
+          ...fakeRun([]),
+          events: (async function* () {
+            yield { type: 'system', sessionId: 's1' } as AgentEvent;
+            yield { type: 'done', sessionId: 's1', terminationReason: 'normal' } as AgentEvent;
+            await gate;
+            yield { type: 'done', terminationReason: 'interrupted' } as AgentEvent;
+          })(),
+          stop: async () => release(),
+          send: (prompt: string) => {
+            sent.push(prompt);
+            return true;
+          },
+        };
+      },
+      labelOf: async (account) => account.label ?? account.id,
+    });
+    const it = run.events[Symbol.asyncIterator]();
+    const seen: AgentEvent[] = [];
+    while (seen.at(-1)?.type !== 'done') seen.push((await it.next()).value as AgentEvent);
+    // The owner pauses `b` while its process is kept.
+    await updateAccount(paths, 'b', { pausedUntil: NOW + HOUR });
+    await pool.refresh();
+    expect(run.send?.('new message')).toBe(true);
+    for (let r = await it.next(); !r.done; r = await it.next()) seen.push(r.value);
+    expect(sent).toEqual([]);
+    expect(calls).toEqual(['b', 'default']);
+    expect(seen).toContainEqual(expect.objectContaining({ type: 'account', switchedFrom: 'b-name', reason: '账户已暂停' }));
+  });
+
+  it('reads a pause as a date (local midnight), a date and time, or a number of days', () => {
+    const now = new Date(2026, 9, 30, 18, 0).getTime();
+    expect(parsePauseUntil({ until: '2026-11-13' }, now)).toBe(new Date(2026, 10, 13).getTime());
+    expect(parsePauseUntil({ until: '2026-11-13T09:00' }, now)).toBe(new Date(2026, 10, 13, 9, 0).getTime());
+    expect(parsePauseUntil({ days: '14' }, now)).toBe(now + 14 * 24 * HOUR);
+    expect(parsePauseUntil({}, now)).toEqual(expect.any(String));
+    expect(parsePauseUntil({ until: '2026-11-13', days: '3' }, now)).toEqual(expect.any(String));
+    expect(parsePauseUntil({ until: '2026-10-01' }, now)).toEqual(expect.any(String));
+    expect(parsePauseUntil({ until: 'soon' }, now)).toEqual(expect.any(String));
+    expect(parsePauseUntil({ days: '-1' }, now)).toEqual(expect.any(String));
+  });
+});
+
 describe('a per-run line cap (课堂精练)', () => {
   const CAP = { seven_day: 80 } as const;
 
@@ -1095,9 +1349,10 @@ describe('a per-run line cap (课堂精练)', () => {
     expect(card).toContain('本周用量到了 80% 的切换线');
     // A borrowed account: the capped run does not make it the main one…
     expect(pool.accounts()[0]!.id).toBe('backup');
-    // …chats still go by score, and backup2 now clearly beats the main one.
-    expect(pool.score('backup2') - pool.score('backup')).toBeGreaterThan(STICKY_MARGIN);
-    expect(pool.pick()?.id).toBe('backup2');
+    // …chats still go by score: both weeks reset together, so nothing is lost
+    // either way and the main one keeps them (a move re-reads the conversation).
+    expect(pool.score('backup2') - pool.score('backup')).toBeLessThanOrEqual(STICKY_MARGIN);
+    expect(pool.pick()?.id).toBe('backup');
   });
 
   it('with every other account at the cap, finishes its turn where it is', async () => {
@@ -1279,5 +1534,170 @@ describe('a switch by name pins the account (在线切号)', () => {
     expect(formatAge(12 * MIN)).toBe('12 分钟前更新');
     expect(formatAge(3 * HOUR)).toBe('3 小时前更新');
     expect(formatAge(50 * HOUR)).toBe('2 天前更新');
+  });
+});
+
+describe('a window about to reset opens its switch line', () => {
+  const MIN = 60_000;
+  const DAY = 24 * HOUR;
+  // The near-reset span follows the bridge's clock: NOW is 10:00 there, NIGHT 22:00.
+  const NIGHT = NOW + 12 * HOUR;
+  let tz: string | undefined;
+  beforeAll(() => {
+    tz = process.env.TZ;
+    process.env.TZ = 'Asia/Shanghai';
+  });
+  afterAll(() => {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  });
+  /** The 2026-10-30 19:05 `/accounts` table: 焦银玲 past her 60% 5-hour line, 5 minutes from its reset. */
+  async function screenshot() {
+    const { pool, paths } = await poolInOrder(
+      [
+        { id: 'backup', label: 'shilong.wang' },
+        { id: 'backup3', label: '汤欢', lines: { five_hour: 60, seven_day: 90 } },
+        { id: 'backup4', label: '焦银玲', lines: { five_hour: 60, seven_day: 90 } },
+        { id: 'default', lines: { five_hour: 80, seven_day: 90 } },
+      ],
+      { five_hour: 98, seven_day: 98 },
+    );
+    pool.observe('backup', limit({ windows: [
+      { kind: 'five_hour', usedPercent: 21, resetsAt: NOW + HOUR + 55 * MIN },
+      { kind: 'seven_day', usedPercent: 64, resetsAt: NOW + 3 * DAY + 14 * HOUR },
+    ] }));
+    pool.observe('backup3', limit({ windows: [
+      { kind: 'five_hour', usedPercent: 40, resetsAt: NOW + 3 * HOUR },
+      { kind: 'seven_day', usedPercent: 0, resetsAt: NOW + 6 * DAY },
+    ] }));
+    pool.observe('backup4', limit({ windows: [
+      { kind: 'five_hour', usedPercent: 61, resetsAt: NOW + 5 * MIN },
+      { kind: 'seven_day', usedPercent: 35, resetsAt: NOW + 5 * DAY + 10 * HOUR },
+    ] }));
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 79, resetsAt: NOW + 2 * DAY }] }));
+    return { pool, paths };
+  }
+
+  it('lets runs go past the line until the reset, and scores what comes back at the reset as room', async () => {
+    const { pool } = await screenshot();
+    expect(pool.lineOf('backup4', 'five_hour', NOW)).toBe(GRACE_LINE);
+    expect(pool.pastLine('backup4', NOW)).toBeUndefined();
+    expect(pool.isBoosted('backup4', NOW)).toBe(false);
+    const rows = accountRows(pool, 'yu.ou', NOW);
+    const table = accountsTable(rows);
+    // Was 0 (past its line): it scores again, its 5-hour room nearly full.
+    expect(table).toContain('| **焦银玲**（备 2，backup4） | 61% / 0h5m | 35% / 5d10h | 60→98% / 90% | 45 | 可用（5 小时窗口临近重置，切换线放宽） |');
+    expect(table).toContain('| **shilong.wang**（主，backup） | 21% / 1h55m | 64% / 3d14h | 98% / 98% | 54 | 可用 |');
+    // yu.ou's week runs out first (2 days, 11 points left): it takes the next run.
+    expect(table).toContain('| ✅ **yu.ou**（备 3，default） | — | 79% / 2d0h | 80% / 90% | 70 | 使用中 |');
+    expect(pool.pick()?.id).toBe('default');
+    expect(switchRefusal(pool, findAccountRow(rows, '焦银玲')!)).toBeUndefined();
+  });
+
+  it('keeps the line while the reset is further off, and never past 98% or a run cap', async () => {
+    const { pool } = await screenshot();
+    // 8–21: only the last 30 minutes of the 5 hours open; 40 minutes before is still the account's own line.
+    const early = NOW - 35 * MIN;
+    expect(pool.lineOf('backup4', 'five_hour', early)).toBe(60);
+    expect(pool.pastLine('backup4', early)?.kind).toBe('five_hour');
+    expect(pool.score('backup4', early)).toBe(0);
+    // Other hours: the last hour.
+    pool.observe('backup3', limit({ windows: [{ kind: 'five_hour', usedPercent: 70, resetsAt: NIGHT + 45 * MIN }] }));
+    expect(pool.lineOf('backup3', 'five_hour', NIGHT)).toBe(GRACE_LINE);
+    expect(pool.lineOf('backup3', 'five_hour', NIGHT - HOUR)).toBe(60);
+    // The run's cap (课堂精练 stops at 80%) still holds.
+    expect(pool.lineOf('backup4', 'five_hour', NOW, { five_hour: 50 })).toBe(50);
+    // 98% and up is past the opened line too.
+    pool.observe('backup4', limit({ windows: [{ kind: 'five_hour', usedPercent: 98, resetsAt: NOW + 5 * MIN }] }));
+    expect(pool.pastLine('backup4', NOW)?.kind).toBe('five_hour');
+    // The week: its last 4 hours from 8 to 20, its last 6 hours otherwise.
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 93, resetsAt: NOW + 3.5 * HOUR }] }));
+    expect(pool.lineOf('default', 'seven_day', NOW)).toBe(GRACE_LINE);
+    expect(pool.pastLine('default', NOW)).toBeUndefined();
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 93, resetsAt: NOW + 4.5 * HOUR }] }));
+    expect(pool.pastLine('default', NOW)?.kind).toBe('seven_day');
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 93, resetsAt: NIGHT + 5 * HOUR }] }));
+    expect(pool.pastLine('default', NIGHT)).toBeUndefined();
+    pool.observe('default', limit({ windows: [{ kind: 'seven_day', usedPercent: 93, resetsAt: NIGHT + 7 * HOUR }] }));
+    expect(pool.pastLine('default', NIGHT)?.kind).toBe('seven_day');
+  });
+
+  it('scores 5-hour room near the reset as nearly full', () => {
+    const view = (five: number, fiveResetIn: number) => ({
+      five_hour: { usedPercent: five, line: 98, resetsInMs: fiveResetIn },
+      seven_day: { usedPercent: 30, line: 90, resetsInMs: 3 * DAY },
+    });
+    expect(switchScore(view(40, 10 * MIN), true, NOW)).toBeGreaterThan(switchScore(view(40, 2 * HOUR), true, NOW));
+    // Daytime: 40 minutes out is not near yet; at night it is.
+    expect(switchScore(view(40, 40 * MIN), true, NOW)).toBeCloseTo(switchScore(view(40, 2 * HOUR), true, NOW));
+    expect(switchScore(view(40, 40 * MIN), true, NIGHT)).toBeGreaterThan(switchScore(view(40, 2 * HOUR), true, NIGHT));
+    expect(switchScore(view(90, 1), true, NOW)).toBeCloseTo(switchScore(view(0, 1), true, NOW), 3);
+  });
+});
+
+describe('reading every account for /accounts (refreshAllQuota)', () => {
+  const MIN = 60_000;
+
+  it('reads every stale account at once, skips fresh and paused ones, and names the ones that failed', async () => {
+    const { pool } = await poolInOrder([...ROSTER, { id: 'backup3', label: '焦银玲', pausedUntil: NOW + 24 * HOUR }]);
+    pool.observe('backup', weekly(5));
+    const probed: string[] = [];
+    let inFlight = 0;
+    let most = 0;
+    const probe = async (p: typeof pool, account: PickedAccount): Promise<boolean | void> => {
+      probed.push(account.id);
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      if (account.id === 'backup2') return false;
+      if (account.id === 'default') throw new Error('offline');
+      p.observe(account.id, weekly(40));
+    };
+    // `backup` reported 30 seconds ago: not read again; the others never reported.
+    expect(await refreshAllQuota(pool, { probe, now: () => NOW + MIN / 2 })).toEqual(expect.arrayContaining(['default', 'backup2']));
+    expect(probed.sort()).toEqual(['backup2', 'default']);
+    expect(most).toBe(2);
+    // Two minutes on, everything is stale again; the paused one is never read.
+    probed.length = 0;
+    const failed = await refreshAllQuota(pool, { probe, now: () => NOW + 2 * MIN });
+    expect(probed.sort()).toEqual(['backup', 'backup2', 'default']);
+    expect(failed.sort()).toEqual(['backup2', 'default']);
+  });
+});
+
+describe('owner-only account names by mood (2026-11-06)', () => {
+  it('shows the mood name only in the owner view, and keeps the label everywhere else', async () => {
+    const { pool, paths } = await poolWith(['b', 'c']);
+    await updateAccount(paths, 'default', { nicknames: { excited: '大王（兴奋）', happy: '大王' } });
+    await updateAccount(paths, 'b', { nicknames: { happy: '欢哥', wronged: '欢哥受委屈了', sad: '欢哥别难过' } });
+    await updateAccount(paths, 'c', { nicknames: { sad: '梅梅姐姐' }, pausedUntil: NOW + 24 * HOUR });
+    await pool.refresh();
+    // b past its 5-hour line: wronged.
+    pool.observe('b', limit({ windows: [{ kind: 'five_hour', usedPercent: 99, resetsAt: NOW + HOUR }] }));
+    const owner = accountRows(pool, 'shilong.wang', NOW, { private: true });
+    expect(owner.map((r) => r.name)).toEqual(['大王（兴奋）', '欢哥受委屈了']);
+    expect(accountRows(pool, 'shilong.wang', NOW).map((r) => r.name)).toEqual(['shilong.wang', 'b-name']);
+    expect(pausedNote(pool, { private: true })).toContain('梅梅姐姐（c）到');
+    expect(pausedNote(pool)).toContain('c-name（c）到');
+    expect(accountsReport(pool, 'shilong.wang', NOW, { private: true }).join('\n')).toContain('**欢哥受委屈了**');
+    expect(accountsReport(pool, 'shilong.wang', NOW).join('\n')).not.toContain('欢哥');
+    // Any of its names finds it in the owner view, none of them elsewhere.
+    expect(findAccountRow(owner, '欢哥')?.id).toBe('b');
+    expect(findAccountRow(owner, 'b-name')?.id).toBe('b');
+    expect(findAccountRow(accountRows(pool, 'shilong.wang', NOW), '欢哥')).toBeUndefined();
+    expect(findPausedAccount(pool, '梅梅姐姐', { private: true })?.id).toBe('c');
+    expect(findPausedAccount(pool, '梅梅姐姐')).toBeUndefined();
+  });
+
+  it('merges by mood, drops a mood on an empty name, and survives a reload', async () => {
+    const { paths } = await poolWith(['b']);
+    await updateAccount(paths, 'b', { nicknames: { happy: '欢哥', sad: '欢欢' } });
+    await updateAccount(paths, 'b', { nicknames: { sad: '', excited: '欢哥冲' } });
+    expect(readAccountsConfig(paths).accounts[1]?.nicknames).toEqual({ happy: '欢哥', excited: '欢哥冲' });
+    await updateAccount(paths, 'b', { nicknames: null });
+    expect(readAccountsConfig(paths).accounts[1]?.nicknames).toBeUndefined();
+    const parsed = parseAccountsConfig(JSON.stringify({ accounts: [{ id: 'b', nicknames: { 高兴: '欢哥', bogus: 'x' } }] }));
+    expect(parsed.accounts.find((a) => a.id === 'b')?.nicknames).toEqual({ happy: '欢哥' });
   });
 });

@@ -62,6 +62,9 @@ export interface ChatContextResult {
  * DM reaches the bot. A topic message without a thread id has no container to
  * read. A scope that already has a session but no cursor predates this feature
  * — its history is in the resumed conversation, and this run sets the cursor.
+ * A topic a prefix just opened (`spawned`) starts from the conversation the
+ * message left — private chats included — since the topic holds nothing but
+ * the message itself yet.
  */
 export function planChatContext(input: {
   mode: 'p2p' | 'group' | 'topic';
@@ -70,6 +73,7 @@ export function planChatContext(input: {
   cursorMs?: number;
   hasSession: boolean;
   untilMs: number;
+  spawned?: boolean;
 }): ChatContextPlan | undefined {
   if (input.mode === 'p2p') return undefined;
   if (input.mode === 'topic' && !input.threadId) return undefined;
@@ -88,6 +92,17 @@ export function planChatContext(input: {
     };
   }
   if (input.hasSession) return undefined;
+  if (input.spawned) {
+    return {
+      container: 'chat',
+      containerId: input.chatId,
+      untilMs: input.untilMs,
+      window: 'parent_recent',
+      afterMs: input.untilMs - CHAT_CONTEXT_LIMITS.recentWindowMs,
+      maxMessages: CHAT_CONTEXT_LIMITS.recentMessages,
+      excludeOwn: false,
+    };
+  }
   if (container.container === 'thread') {
     return {
       ...base,

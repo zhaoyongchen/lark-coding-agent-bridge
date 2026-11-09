@@ -52,6 +52,12 @@ export interface RunState {
   /** Set when terminal === 'interrupted' because the message that started
    * the run was recalled — the card says so instead of a plain "stopped". */
   interruptReason?: 'recalled';
+  /**
+   * Background tasks (backgrounded shells, monitors, background subagents)
+   * the agent last reported running. Above zero when the turn ends, the task
+   * is not over: the process works on and reports back in a later turn.
+   */
+  background?: number;
 }
 
 export const initialState: RunState = {
@@ -209,6 +215,9 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
       };
     }
 
+    case 'background':
+      return state.background === evt.count ? state : { ...state, background: evt.count };
+
     case 'done': {
       const terminal =
         evt.terminationReason === 'interrupted'
@@ -230,6 +239,14 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
     default:
       return state;
   }
+}
+
+/**
+ * Background tasks still running when the run ended `done` — the answer is in,
+ * the task is not; 0 otherwise.
+ */
+export function backgroundLeft(state: RunState | undefined): number {
+  return state?.terminal === 'done' ? (state.background ?? 0) : 0;
 }
 
 export function markInterrupted(state: RunState): RunState {

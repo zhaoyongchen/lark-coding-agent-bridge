@@ -20,12 +20,18 @@ describe('run card byline usage', () => {
     expect(card).not.toContain('Usage:');
   });
 
-  it('puts a conversation notice above the byline', () => {
+  it('puts a conversation notice at the top, above the answer — it happened before the run', () => {
     const card = JSON.stringify(
-      renderCard(finished, { meta: { title: 'CC', agent: 'claude', notice: '已自动开启新会话' } }),
+      renderCard(finished, { meta: { title: 'CC', agent: 'claude', notice: '本轮从新会话开始' } }),
     );
-    expect(card).toContain('🔄 已自动开启新会话');
-    expect(card.indexOf('已自动开启新会话')).toBeLessThan(card.indexOf('Agent: claude'));
+    expect(card).toContain('🔄 本轮从新会话开始');
+    expect(card.indexOf('本轮从新会话开始')).toBeLessThan(card.indexOf('answer'));
+  });
+
+  it('shows the notice while the run is still going', () => {
+    const running = reduce(initialState, { type: 'text', delta: 'working' });
+    const card = JSON.stringify(renderCard(running, { meta: { title: 'CC', notice: '本轮从新会话开始' } }));
+    expect(card).toContain('🔄 本轮从新会话开始');
   });
 
   it('warns about a large context with a button that starts a new session', () => {
