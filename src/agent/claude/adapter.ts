@@ -87,6 +87,8 @@ export class ClaudeAdapter implements AgentAdapter {
       agentName: 'Claude Code',
       command: this.binary,
       binaryPath: this.binary,
+      // Windows 上 claude 是约 290MB 的原生二进制，冷启动 --version 可达 6s，默认 5s 会误判为不可用。
+      timeoutMs: 30_000,
     });
   }
 
